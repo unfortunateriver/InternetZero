@@ -994,4 +994,683 @@ func currentMoneroBlockHeight() (uint64, error) {
         } `json:"error"`
     }
     if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
- 
+        return 0, fmt.Errorf("failed to decode monerod response: %w", err)
+    }
+    if rpcResp.Error.Code != 0 {
+        return 0, fmt.Errorf("monerod RPC error: %s", rpcResp.Error.Message)
+    }
+    return rpcResp.Result.Count, nil
+}
+
+// ========== ENCRYPTED DATABASE ==========
+
+type EncryptedDatabase struct {
+    path        string
+    crypto      *CryptoHelper
+    mu          sync.RWMutex
+    markets     map[string]*Market
+    betOffers   map[string]*BetOffer
+    acceptances map[string]*Acceptance
+    resolutions map[string]*Resolution
+    disputes    map[string]*Dispute
+    complaints  map[string]*Complaint
+    oracles     map[string]*OracleAnnouncement
+}
+
+func NewEncryptedDatabase(path string, password string) (*EncryptedDatabase, error) {
+    if err := os.MkdirAll(path, 0700); err != nil {
+        return nil, fmt.Errorf("failed to create db dir: %w", err)
+    }
+
+    crypto, err := NewCryptoHelper(password)
+    if err != nil {
+        return nil, err
+    }
+
+    db := &EncryptedDatabase{
+        path:        path,
+        crypto:      crypto,
+        markets:     make(map[string]*Market),
+        betOffers:   make(map[string]*BetOffer),
+        acceptances: make(map[string]*Acceptance),
+        resolutions: make(map[string]*Resolution),
+        disputes:    make(map[string]*Dispute),
+        complaints:  make(map[string]*Complaint),
+        oracles:     make(map[string]*OracleAnnouncement),
+    }
+
+    if err := db.load(); err != nil {
+        return nil, err
+    }
+    return db, nil
+}
+
+func (db *EncryptedDatabase) encryptAndSave(data interface{}, filename string) error {
+    jsonData, err := json.MarshalIndent(data, "", "  ")
+    if err != nil {
+        return err
+    }
+    
+    encrypted, err := db.crypto.Encrypt(jsonData)
+    if err != nil {
+        return err
+    }
+    
+    saltFile := filename + ".salt"
+    if err := os.WriteFile(filepath.Join(db.path, saltFile), db.crypto.salt, 0600); err != nil {
+        return err
+    }
+    
+    return os.WriteFile(filepath.Join(db.path, filename), encrypted, 0600)
+}
+
+func (db *EncryptedDatabase) loadAndDecrypt(data interface{}, filename string) error {
+    encryptedPath := filepath.Join(db.path, filename)
+    if _, err := os.Stat(encryptedPath); os.IsNotExist(err) {
+        return nil
+    }
+    
+    encrypted, err := os.ReadFile(encryptedPath)
+    if err != nil {
+        return err
+    }
+    
+    saltPath := filepath.Join(db.path, filename+".salt")
+    salt, err := os.ReadFile(saltPath)
+    if err != nil {
+        salt = db.crypto.salt
+    }
+    
+    crypto := NewCryptoHelperWithSalt(string(db.crypto.password), salt)
+    decrypted, err := crypto.Decrypt(encrypted)
+    if err != nil {
+        return err
+    }
+    
+    return json.Unmarshal(decrypted, data)
+}
+
+func (db *EncryptedDatabase) load() error {
+    if err := db.loadAndDecrypt(&db.markets, "markets.enc"); err != nil {
+        return err
+    }
+    if err := db.loadAndDecrypt(&db.betOffers, "bets.enc"); err != nil {
+        return err
+    }
+    if err := db.loadAndDecrypt(&db.acceptances, "acceptances.enc"); err != nil {
+        return err
+    }
+    if err := db.loadAndDecrypt(&db.resolutions, "resolutions.enc"); err != nil {
+        return err
+    }
+    if err := db.loadAndDecrypt(&db.disputes, "disputes.enc"); err != nil {
+        return err
+    }
+    if err := db.loadAndDecrypt(&db.complaints, "complaints.enc"); err != nil {
+        return err
+    }
+    if err := db.loadAndDecrypt(&db.oracles, "oracles.enc"); err != nil {
+        return err
+    }
+    return nil
+}
+
+func (db *EncryptedDatabase) save() error {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    
+    if err := db.encryptAndSave(db.markets, "markets.enc"); err != nil {
+        return err
+    }
+    if err := db.encryptAndSave(db.betOffers, "bets.enc"); err != nil {
+        return err
+    }
+    if err := db.encryptAndSave(db.acceptances, "acceptances.enc"); err != nil {
+        return err
+    }
+    if err := db.encryptAndSave(db.resolutions, "resolutions.enc"); err != nil {
+        return err
+    }
+    if err := db.encryptAndSave(db.disputes, "disputes.enc"); err != nil {
+        return err
+    }
+    if err := db.encryptAndSave(db.complaints, "complaints.enc"); err != nil {
+        return err
+    }
+    if err := db.encryptAndSave(db.oracles, "oracles.enc"); err != nil {
+        return err
+    }
+    return nil
+}
+
+func (db *EncryptedDatabase) AddMarket(m *Market) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    db.markets[m.ID] = m
+    return db.save()
+}
+
+func (db *EncryptedDatabase) GetMarket(id string) (*Market, bool) {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    m, ok := db.markets[id]
+    return m, ok
+}
+
+func (db *EncryptedDatabase) ListMarkets(includeExpired bool) []*Market {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    var list []*Market
+    currentHeight, _ := currentMoneroBlockHeight()
+    for _, m := range db.markets {
+        if !includeExpired && m.ResolutionBlock+7200 < currentHeight {
+            continue
+        }
+        list = append(list, m)
+    }
+    return list
+}
+
+func (db *EncryptedDatabase) UpdateMarketLiability(marketID string, additional uint64) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    if m, ok := db.markets[marketID]; ok {
+        m.UsedLiability += additional
+        return db.save()
+    }
+    return fmt.Errorf("market not found")
+}
+
+func (db *EncryptedDatabase) AddBetOffer(b *BetOffer) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    
+    for _, existing := range db.betOffers {
+        if existing.DepositTxID == b.DepositTxID {
+            return fmt.Errorf("deposit transaction %s already used", b.DepositTxID[:16])
+        }
+        if existing.MarketID == b.MarketID && 
+           existing.Nonce == b.Nonce && 
+           string(existing.BettorSigningKey) == string(b.BettorSigningKey) {
+            return fmt.Errorf("duplicate bet offer detected")
+        }
+    }
+    db.betOffers[b.ID] = b
+    return db.save()
+}
+
+func (db *EncryptedDatabase) GetBetOffersForMarket(marketID string, status string) []*BetOffer {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    var list []*BetOffer
+    for _, b := range db.betOffers {
+        if b.MarketID == marketID && (status == "" || b.Status == status) {
+            list = append(list, b)
+        }
+    }
+    return list
+}
+
+func (db *EncryptedDatabase) GetMyBets(bettorKey []byte) []*BetOffer {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    var list []*BetOffer
+    for _, b := range db.betOffers {
+        if bytes.Equal(b.BettorSigningKey, bettorKey) {
+            list = append(list, b)
+        }
+    }
+    return list
+}
+
+func (db *EncryptedDatabase) UpdateBetOfferStatus(id string, status string) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    if b, ok := db.betOffers[id]; ok {
+        b.Status = status
+        return db.save()
+    }
+    return fmt.Errorf("bet offer not found")
+}
+
+func (db *EncryptedDatabase) AddAcceptance(a *Acceptance) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    db.acceptances[a.BetOfferID] = a
+    return db.save()
+}
+
+func (db *EncryptedDatabase) GetAcceptance(betOfferID string) (*Acceptance, bool) {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    a, ok := db.acceptances[betOfferID]
+    return a, ok
+}
+
+func (db *EncryptedDatabase) AddResolution(r *Resolution) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    db.resolutions[r.MarketID] = r
+    return db.save()
+}
+
+func (db *EncryptedDatabase) GetResolution(marketID string) (*Resolution, bool) {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    r, ok := db.resolutions[marketID]
+    return r, ok
+}
+
+func (db *EncryptedDatabase) AddDispute(d *Dispute) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    db.disputes[d.ID] = d
+    return db.save()
+}
+
+func (db *EncryptedDatabase) AddComplaint(c *Complaint) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    db.complaints[c.ID] = c
+    return db.save()
+}
+
+func (db *EncryptedDatabase) AddOracle(oa *OracleAnnouncement) error {
+    db.mu.Lock()
+    defer db.mu.Unlock()
+    db.oracles[oa.ID] = oa
+    return db.save()
+}
+
+func (db *EncryptedDatabase) GetOracles() []*OracleAnnouncement {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    var list []*OracleAnnouncement
+    for _, o := range db.oracles {
+        list = append(list, o)
+    }
+    return list
+}
+
+func (db *EncryptedDatabase) GetBetOfferForID(id string) (*BetOffer, bool) {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+    b, ok := db.betOffers[id]
+    return b, ok
+}
+
+func (db *EncryptedDatabase) ExportBackup() error {
+    db.mu.RLock()
+    defer db.mu.RUnlock()
+
+    backup := struct {
+        Timestamp   uint64                       `json:"timestamp"`
+        Markets     map[string]*Market           `json:"markets"`
+        BetOffers   map[string]*BetOffer         `json:"bet_offers"`
+        Acceptances map[string]*Acceptance       `json:"acceptances"`
+    }{
+        Timestamp:   uint64(time.Now().Unix()),
+        Markets:     db.markets,
+        BetOffers:   db.betOffers,
+        Acceptances: db.acceptances,
+    }
+
+    jsonData, err := json.MarshalIndent(backup, "", "  ")
+    if err != nil {
+        return err
+    }
+    
+    encrypted, err := db.crypto.Encrypt(jsonData)
+    if err != nil {
+        return err
+    }
+
+    filename := fmt.Sprintf("prediction_backup_%d.enc", backup.Timestamp)
+    return os.WriteFile(filename, encrypted, 0600)
+}
+
+// ========== MONERO CLIENT ==========
+
+type MoneroClient struct {
+    client   *walletrpc.Client
+    ctx      context.Context
+    username string
+    password string
+}
+
+func NewMoneroClient(username, password string) (*MoneroClient, error) {
+    ctx := context.Background()
+
+    httpClient := &http.Client{
+        Transport: httpdigest.New(username, password),
+    }
+
+    client := walletrpc.New(walletrpc.Config{
+        Address: "http://127.0.0.1:18082/json_rpc",
+        Client:  httpClient,
+    })
+
+    // Test connection
+    _, err := client.GetBalance(ctx, &walletrpc.GetBalanceRequest{
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("cannot connect to monero-wallet-rpc: %w\n"+
+            "Please run: monero-wallet-rpc --wallet-file wallet.bin --rpc-bind-port 18082 --rpc-login %s:***\n", err, username)
+    }
+
+    return &MoneroClient{
+        client:   client,
+        ctx:      ctx,
+        username: username,
+        password: password,
+    }, nil
+}
+
+func (m *MoneroClient) GetCurrentBlockHeight() (uint64, error) {
+    return currentMoneroBlockHeight()
+}
+
+func (m *MoneroClient) GenerateSubaddress(accountIndex uint32, label string) (uint32, string, error) {
+    resp, err := m.client.CreateAddress(m.ctx, &walletrpc.CreateAddressRequest{
+        AccountIndex: accountIndex,
+        Label:        label,
+    })
+    if err != nil {
+        return 0, "", fmt.Errorf("failed to create address: %w", err)
+    }
+    return resp.AddressIndex, resp.Address, nil
+}
+
+func (m *MoneroClient) CheckDeposit(subaddressIndex uint32, expectedAmount uint64) (string, uint64, int, error) {
+    transfers, err := m.client.GetTransfers(m.ctx, &walletrpc.GetTransfersRequest{
+        In:           true,
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return "", 0, 0, fmt.Errorf("failed to get transfers: %w", err)
+    }
+
+    for _, tx := range transfers.In {
+        if tx.SubaddrIndex.Minor == subaddressIndex {
+            daemonHeight, err := currentMoneroBlockHeight()
+            if err != nil {
+                return tx.TxID, tx.Amount, 0, nil
+            }
+            confirmations := int(daemonHeight - tx.Height)
+            return tx.TxID, tx.Amount, confirmations, nil
+        }
+    }
+    return "", 0, 0, nil
+}
+
+func (m *MoneroClient) SendPayout(address string, amount uint64) (string, error) {
+    resp, err := m.client.Transfer(m.ctx, &walletrpc.TransferRequest{
+        Destinations: []walletrpc.Destination{
+            {Address: address, Amount: amount},
+        },
+        AccountIndex: 0,
+        Priority:     walletrpc.PriorityUnimportant,
+    })
+    if err != nil {
+        return "", fmt.Errorf("failed to send payout: %w", err)
+    }
+    return resp.TxHash, nil
+}
+
+func (m *MoneroClient) SendDeveloperFee(amount uint64) (string, error) {
+    if amount == 0 {
+        return "", nil
+    }
+    return m.SendPayout(DeveloperAddress, amount)
+}
+
+func (m *MoneroClient) GetBalance() (uint64, uint64, error) {
+    resp, err := m.client.GetBalance(m.ctx, &walletrpc.GetBalanceRequest{
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return 0, 0, err
+    }
+    return resp.Balance, resp.UnlockedBalance, nil
+}
+
+// ========== I2P NETWORK ==========
+
+type I2PNetwork struct {
+    sam      *sam3.SAM
+    session  *sam3.StreamSession
+    identity *UserIdentity
+    ctx      context.Context
+    cancel   context.CancelFunc
+    mu       sync.RWMutex
+}
+
+func NewI2PNetwork(identity *UserIdentity) (*I2PNetwork, error) {
+    sam, err := sam3.NewSAM("127.0.0.1:7656")
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to I2P SAM bridge: %w\n"+
+            "Please ensure I2P router is running (i2prouter start or i2pd --sam.enabled=true)", err)
+    }
+
+    var keys *sam3.Keys
+    if identity.I2PPrivateKey != nil && identity.I2PPublicKey != nil {
+        keys = &sam3.Keys{
+            Pub:  identity.I2PPublicKey,
+            Priv: identity.I2PPrivateKey,
+        }
+    } else {
+        keys, err = sam.NewKeys()
+        if err != nil {
+            return nil, fmt.Errorf("failed to generate I2P keys: %w", err)
+        }
+        identity.I2PPublicKey = keys.Pub
+        identity.I2PPrivateKey = keys.Priv
+    }
+
+    session, err := sam.NewStreamSession("prediction-market", keys, sam3.Options{
+        "inbound.length":   "3",
+        "outbound.length":  "3",
+        "inbound.quantity": "3",
+        "outbound.quantity": "3",
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to create I2P session: %w", err)
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    return &I2PNetwork{
+        sam:      sam,
+        session:  session,
+        identity: identity,
+        ctx:      ctx,
+        cancel:   cancel,
+    }, nil
+}
+
+func (i *I2PNetwork) GetDestination() string {
+    return i.session.Dest().String()
+}
+
+func (i *I2PNetwork) GetBase32Address() string {
+    return i.session.Dest().Base32()
+}
+
+func (i *I2PNetwork) DialPeer(dest string) (net.Conn, error) {
+    if !isValidI2PAddress(dest) {
+        return nil, fmt.Errorf("invalid I2P address")
+    }
+    return i.session.Dial(dest)
+}
+
+func (i *I2PNetwork) StartListener(handler func(conn net.Conn)) error {
+    listener, err := i.session.Listen()
+    if err != nil {
+        return fmt.Errorf("failed to create listener: %w", err)
+    }
+
+    go func() {
+        for {
+            select {
+            case <-i.ctx.Done():
+                return
+            default:
+                conn, err := listener.Accept()
+                if err != nil {
+                    continue
+                }
+                go handler(conn)
+            }
+        }
+    }()
+
+    return nil
+}
+
+func (i *I2PNetwork) Stop() {
+    i.cancel()
+}
+
+// ========== ENCRYPTED USER IDENTITY ==========
+
+type UserIdentity struct {
+    SigningPrivateKey ed25519.PrivateKey
+    SigningPublicKey  ed25519.PublicKey
+    I2PPrivateKey     ed25519.PrivateKey
+    I2PPublicKey      ed25519.PublicKey
+    MoneroSeed        string
+}
+
+func NewUserIdentity(dbPath, password, recoveryMnemonic string) (*UserIdentity, error) {
+    identityPath := filepath.Join(dbPath, "identity.enc")
+    saltPath := filepath.Join(dbPath, "identity.salt")
+    
+    if recoveryMnemonic != "" {
+        fmt.Println("Recovery mode: Attempting to restore from mnemonic...")
+    }
+
+    if encData, err := os.ReadFile(identityPath); err == nil {
+        salt, err := os.ReadFile(saltPath)
+        if err != nil {
+            return nil, fmt.Errorf("failed to read identity salt: %w", err)
+        }
+        
+        crypto := NewCryptoHelperWithSalt(password, salt)
+        jsonData, err := crypto.Decrypt(encData)
+        if err != nil {
+            return nil, fmt.Errorf("failed to decrypt identity (wrong password?): %w", err)
+        }
+        
+        var identity UserIdentity
+        if err := json.Unmarshal(jsonData, &identity); err != nil {
+            return nil, err
+        }
+        return &identity, nil
+    }
+
+    pub, priv, err := ed25519.GenerateKey(rand.Reader)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate signing key: %w", err)
+    }
+
+    seedBytes := make([]byte, 32)
+    if _, err := rand.Read(seedBytes); err != nil {
+        return nil, fmt.Errorf("failed to generate seed: %w", err)
+    }
+
+    identity := &UserIdentity{
+        SigningPrivateKey: priv,
+        SigningPublicKey:  pub,
+        MoneroSeed:        hex.EncodeToString(seedBytes),
+    }
+
+    jsonData, err := json.MarshalIndent(identity, "", "  ")
+    if err != nil {
+        return nil, err
+    }
+    
+    crypto, err := NewCryptoHelper(password)
+    if err != nil {
+        return nil, err
+    }
+    
+    encrypted, err := crypto.Encrypt(jsonData)
+    if err != nil {
+        return nil, err
+    }
+    
+    if err := os.WriteFile(identityPath, encrypted, 0600); err != nil {
+        return nil, err
+    }
+    if err := os.WriteFile(saltPath, crypto.salt, 0600); err != nil {
+        return nil, err
+    }
+
+    return identity, nil
+}
+
+// ========== ORACLE SYSTEM ==========
+
+type OracleSystem struct {
+    db       *EncryptedDatabase
+    monero   *MoneroClient
+    identity *UserIdentity
+    i2p      *I2PNetwork
+}
+
+func NewOracleSystem(db *EncryptedDatabase, monero *MoneroClient, identity *UserIdentity, i2p *I2PNetwork) *OracleSystem {
+    return &OracleSystem{
+        db:       db,
+        monero:   monero,
+        identity: identity,
+        i2p:      i2p,
+    }
+}
+
+func (o *OracleSystem) AnnounceAsOracle(stakeAmount uint64) error {
+    idx, addr, err := o.monero.GenerateSubaddress(0, "Oracle Stake")
+    if err != nil {
+        return err
+    }
+
+    fmt.Printf("\nSend %.4f XMR stake to:\n%s\n", float64(stakeAmount)/1e12, addr)
+    fmt.Print("Press ENTER after sending...")
+    bufio.NewReader(os.Stdin).ReadString('\n')
+
+    var stakeTxID string
+    fmt.Print("Waiting for confirmation")
+    for i := 0; i < 60; i++ {
+        txID, amount, confs, err := o.monero.CheckDeposit(idx, stakeAmount)
+        if err == nil && amount >= stakeAmount && confs >= ConfirmationThresholdLarge {
+            stakeTxID = txID
+            break
+        }
+        fmt.Print(".")
+        time.Sleep(2 * time.Second)
+    }
+    fmt.Println()
+
+    if stakeTxID == "" {
+        return fmt.Errorf("stake not confirmed after 120 seconds")
+    }
+
+    height, err := o.monero.GetCurrentBlockHeight()
+    if err != nil {
+        height = 0
+    }
+    announcement := &OracleAnnouncement{
+        ID:            sha256Hash([]byte(stakeTxID)),
+        StakingTxID:   stakeTxID,
+        StakingAmount: stakeAmount,
+        SigningKey:    o.identity.SigningPublicKey,
+        I2PDest:       o.i2p.GetDestination(),
+        BlockHeight:   height,
+    }
+
+    return o.db.AddOracle(announcement)
+}
+
+func (o *OracleSystem) SelectOracles(marketID string, resolutionBlock uint64) []*OracleAnnouncement {
+    seed := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", marketID, resolutionBlock)))
+    rng := binar
