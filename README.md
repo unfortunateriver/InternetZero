@@ -19,7 +19,7 @@ The network uses a Kademlia DHT over I2P for peer discovery and message propagat
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/prediction-market.git
+git clone https://github.com/unfortunateriver/InternetZero
 cd prediction-market
 go mod init prediction-market
 go get github.com/majestrate/i2p-tools/sam3
