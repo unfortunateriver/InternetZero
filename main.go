@@ -1,4 +1,4 @@
-// main.go - Prediction Market Client with Oracle Approval Voting & Heartbeat
+// main.go - Prediction Market Client 
 package main
 
 import (
