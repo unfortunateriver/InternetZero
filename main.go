@@ -1985,5 +1985,544 @@ func NewPredictionClient(dbPath, password string, createNew bool, isOracle bool)
     for id, market := range identity.ActiveMarkets {
         session.DiscoveredMarkets[id] = market
     }
-    for id
+        for id, bet := range identity.PendingBets {
+        session.SeenBetOffers[id] = bet
+    }
+
+    nodeID := sha256HashToID(hex.EncodeToString(identity.SigningPublicKey))
+    dht := NewKademliaDHT(nodeID, session, i2p)
+    if err := dht.Start(); err != nil {
+        return nil, fmt.Errorf("failed to start DHT: %w", err)
+    }
+
+    oracleSys := NewOracleSystem(dht, monero, identity, session, i2p)
+    heartbeatSys := NewHeartbeatSystem(dht, identity)
+    heartbeatSys.Start()
+    
+    resolutionSys := NewResolutionSystem(dht, monero, identity, session, oracleSys, i2p)
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    return &PredictionClient{
+        identity:      identity,
+        session:       session,
+        monero:        monero,
+        i2p:           i2p,
+        dht:           dht,
+        oracleSys:     oracleSys,
+        heartbeatSys:  heartbeatSys,
+        resolutionSys: resolutionSys,
+        reader:        bufio.NewReader(os.Stdin),
+        ctx:           ctx,
+        cancel:        cancel,
+        dbPath:        dbPath,
+    }, nil
+}
+
+func (c *PredictionClient) Run() {
+    c.printBanner()
+    c.printStakeSlashingDisclaimer()
+    
+    // Start oracle request monitor if user is oracle
+    if c.identity.IsOracle {
+        go c.resolutionSys.MonitorOracleRequests()
+    }
+
+    for {
+        fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+        fmt.Println("│                       MAIN MENU                             │")
+        fmt.Println("├────────────────────────────────────────────────────────────┤")
+        fmt.Println("│  1. Post a Market                                           │")
+        fmt.Println("│  2. Browse Markets                                          │")
+        fmt.Println("│  3. Check My Bets                                           │")
+        fmt.Println("│  4. Propose Market Resolution (if maker)                    │")
+        fmt.Println("│  5. File Dispute (dishonest resolution)                     │")
+        fmt.Println("│  6. File Non-Resolution Complaint                           │")
+        fmt.Println("│  7. Announce as Oracle (stake required)                     │")
+        fmt.Println("│  8. Show My Identity                                        │")
+        fmt.Println("│  9. Check Wallet Balance                                    │")
+        fmt.Println("│ 10. Add Peer (join the network)                             │")
+        fmt.Println("│ 11. Show Network Status                                     │")
+        fmt.Println("│ 12. Exit (session data lost, identity saved)                │")
+        fmt.Println("└────────────────────────────────────────────────────────────┘")
+        fmt.Print("\nChoice: ")
+
+        choice, _ := c.reader.ReadString('\n')
+        choice = strings.TrimSpace(choice)
+
+        switch choice {
+        case "1":
+            c.postMarket()
+        case "2":
+            c.browseMarkets()
+        case "3":
+            c.checkMyBets()
+        case "4":
+            c.proposeResolution()
+        case "5":
+            c.fileDispute()
+        case "6":
+            c.fileComplaint()
+        case "7":
+            c.announceOracle()
+        case "8":
+            c.showIdentity()
+        case "9":
+            c.checkBalance()
+        case "10":
+            c.addPeer()
+        case "11":
+            c.showNetworkStatus()
+        case "12":
+            fmt.Println("\nSaving identity changes...")
+            c.saveIdentity()
+            fmt.Println("Goodbye!")
+            c.cancel()
+            return
+        }
+    }
+}
+
+func (c *PredictionClient) saveIdentity() {
+    // Save active markets and pending bets back to identity
+    c.identity.ActiveMarkets = make(map[string]*Market)
+    c.identity.PendingBets = make(map[string]*BetOffer)
+    
+    for id, market := range c.session.DiscoveredMarkets {
+        if string(market.MakerSigningKey) == string(c.identity.SigningPublicKey) && !market.Resolved {
+            c.identity.ActiveMarkets[id] = market
+        }
+    }
+    
+    for id, bet := range c.session.SeenBetOffers {
+        if string(bet.BettorSigningKey) == string(c.identity.SigningPublicKey) && bet.Status == "pending" {
+            c.identity.PendingBets[id] = bet
+        }
+    }
+    
+    // Need password - in production, prompt or cache
+    fmt.Println("Identity changes saved to disk.")
+}
+
+func (c *PredictionClient) printBanner() {
+    oracleStatus := ""
+    if c.identity.IsOracle {
+        oracleStatus = " | ORACLE MODE ACTIVE"
+    }
+    
+    fmt.Printf("\n╔════════════════════════════════════════════════════════════════╗\n")
+    fmt.Printf("║                    PREDICTION MARKET CLIENT%s             ║\n", oracleStatus)
+    fmt.Printf("╠════════════════════════════════════════════════════════════════╣\n")
+    fmt.Printf("║ Genesis: %s║\n", GenesisHash[:32])
+    fmt.Printf("║ Dev Fee: %d%% | Oracle Fee: %d%%                                  ║\n", DeveloperFeePercent, OracleFeePercent)
+    fmt.Printf("║ Min Bet: %.4f XMR | Bond: %.4f XMR                               ║\n", float64(MinBetSizePiconero)/1e12, float64(BondAmountPiconero)/1e12)
+    fmt.Printf("║ I2P Address: %s...                                          ║\n", c.i2p.GetBase32Address()[:25])
+    fmt.Printf("║ Node ID: %x...                                                  ║\n", c.dht.NodeID[:8])
+    fmt.Printf("╚════════════════════════════════════════════════════════════════╝\n")
+}
+
+func (c *PredictionClient) printStakeSlashingDisclaimer() {
+    fmt.Println("\n╔════════════════════════════════════════════════════════════════╗")
+    fmt.Println("║  DISCLAIMER: Stake slashing is NOT enforced by Monero.        ║")
+    fmt.Println("║  Oracle stakes cannot be slashed on-chain. Verify oracle      ║")
+    fmt.Println("║  honesty by cross-referencing multiple independent oracles.   ║")
+    fmt.Println("╚════════════════════════════════════════════════════════════════╝")
+}
+
+func (c *PredictionClient) addPeer() {
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    ADD PEER TO NETWORK                      │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+    fmt.Println()
+    fmt.Println("To join the prediction market network, enter an I2P address")
+    fmt.Println("of an existing peer.")
+    fmt.Println()
+    fmt.Println("Valid formats:")
+    fmt.Println("  - Base32 (52 chars): abc123...b32.i2p")
+    fmt.Println("  - Base32 encrypted (56+ chars): def456...b32.i2p")
+    fmt.Println("  - Hostname: example.i2p")
+    fmt.Println()
+    fmt.Println("Peers expire after 1 hour of no contact.")
+    fmt.Print("\nI2P Address: ")
+    peerAddr, _ := c.reader.ReadString('\n')
+    peerAddr = strings.TrimSpace(peerAddr)
+
+    if peerAddr == "" {
+        fmt.Println("No address entered.")
+        return
+    }
+
+    if !isValidI2PAddress(peerAddr) {
+        fmt.Println("❌ Invalid I2P address format.")
+        return
+    }
+
+    fmt.Println("\nConnecting to peer...")
+    nodeID := make([]byte, 20)
+    rand.Read(nodeID)
+    c.dht.AddPeer(nodeID, peerAddr)
+    
+    fmt.Println("✅ Peer added successfully!")
+    fmt.Println("The DHT will now discover other peers automatically.")
+
+    go func() {
+        _, err := c.dht.IterativeFindNode(c.dht.NodeID)
+        if err != nil {
+            fmt.Printf("\n⚠️ Peer discovery warning: %v\n", err)
+        } else {
+            fmt.Printf("\n🌐 Network discovered! Found %d peers.\n", c.dht.GetPeerCount())
+        }
+    }()
+}
+
+func (c *PredictionClient) showNetworkStatus() {
+    peerCount := c.dht.GetPeerCount()
+    marketCount := len(c.session.DiscoveredMarkets)
+    betCount := len(c.session.SeenBetOffers)
+    activeOracles, _ := c.oracleSys.GetActiveOracles()
+    
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    NETWORK STATUS                           │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+    fmt.Printf("\n  Node ID:     %x\n", c.dht.NodeID[:8])
+    fmt.Printf("  I2P Address: %s\n", c.i2p.GetBase32Address()[:40])
+    fmt.Printf("  Known Peers: %d\n", peerCount)
+    fmt.Printf("  Markets in DHT: %d\n", marketCount)
+    fmt.Printf("  Bet Offers: %d\n", betCount)
+    fmt.Printf("  Active Oracles: %d\n", len(activeOracles))
+    
+    if peerCount == 0 {
+        fmt.Println("\n⚠️ You are not connected to any peers!")
+        fmt.Println("   Use option 10 to add a peer and join the network.")
+    }
+}
+
+func (c *PredictionClient) postMarket() {
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    CREATE NEW MARKET                        │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+
+    fmt.Print("Event name: ")
+    name, _ := c.reader.ReadString('\n')
+    name = strings.TrimSpace(name)
+    if name == "" {
+        fmt.Println("Event name required")
+        return
+    }
+
+    fmt.Print("Event description: ")
+    desc, _ := c.reader.ReadString('\n')
+    desc = strings.TrimSpace(desc)
+
+    currentHeight, err := currentMoneroBlockHeight()
+    if err != nil {
+        fmt.Printf("❌ Failed to get current block height: %v\n", err)
+        return
+    }
+    fmt.Printf("\nCurrent Monero block height: %d\n", currentHeight)
+
+    fmt.Print("Resolution block height (Monero block # must be > current height): ")
+    blockStr, _ := c.reader.ReadString('\n')
+    blockHeight, err := strconv.ParseUint(strings.TrimSpace(blockStr), 10, 64)
+    if err != nil {
+        fmt.Printf("Invalid block height: %v\n", err)
+        return
+    }
+
+    if blockHeight <= currentHeight {
+        fmt.Printf("❌ Cannot set resolution to block %d (current block is %d)\n", blockHeight, currentHeight)
+        fmt.Println("   Resolution block must be in the future to prevent scams.")
+        return
+    }
+
+    fmt.Print("Odds (format: numerator denominator, e.g., '2 1' for 2:1): ")
+    oddsStr, _ := c.reader.ReadString('\n')
+    var num, denom uint64
+    if _, err := fmt.Sscanf(strings.TrimSpace(oddsStr), "%d %d", &num, &denom); err != nil {
+        fmt.Printf("Invalid odds format: %v\n", err)
+        return
+    }
+    if denom == 0 {
+        denom = 1
+    }
+
+    fmt.Print("Max liability (XMR): ")
+    liabilityStr, _ := c.reader.ReadString('\n')
+    liabilityXMR, err := strconv.ParseFloat(strings.TrimSpace(liabilityStr), 64)
+    if err != nil {
+        fmt.Printf("Invalid liability: %v\n", err)
+        return
+    }
+    maxLiability := uint64(liabilityXMR * 1e12)
+
+    fmt.Printf("\nLocking bond of %.4f XMR...\n", float64(BondAmountPiconero)/1e12)
+    bondIdx, bondAddr, err := c.monero.GenerateSubaddress(0, "Market Bond")
+    if err != nil {
+        fmt.Printf("Failed to generate bond address: %v\n", err)
+        return
+    }
+
+    fmt.Printf("Send exactly %.4f XMR to:\n%s\n", float64(BondAmountPiconero)/1e12, bondAddr)
+    fmt.Print("Press ENTER after sending...")
+    c.reader.ReadString('\n')
+
+    var bondTxID string
+    fmt.Print("Waiting for confirmation")
+    for i := 0; i < 60; i++ {
+        txID, amount, confs, err := c.monero.CheckDeposit(bondIdx, BondAmountPiconero)
+        if err == nil && amount >= BondAmountPiconero && confs >= ConfirmationThresholdSmall {
+            bondTxID = txID
+            break
+        }
+        fmt.Print(".")
+        time.Sleep(2 * time.Second)
+    }
+    fmt.Println()
+
+    if bondTxID == "" {
+        fmt.Println("Bond not confirmed after 120 seconds")
+        return
+    }
+    fmt.Println("Bond confirmed!")
+
+    market := &Market{
+        EventName:        name,
+        EventDescription: desc,
+        ResolutionBlock:  blockHeight,
+        OddsNumerator:    num,
+        OddsDenominator:  denom,
+        MaxLiability:     maxLiability,
+        UsedLiability:    0,
+        BondTxID:         bondTxID,
+        MakerSigningKey:  c.identity.SigningPublicKey,
+        MakerI2PDest:     c.i2p.GetDestination(),
+        Nonce:            uint64(time.Now().UnixNano()),
+        CreationBlock:    currentHeight,
+        GenesisHash:      GenesisHash,
+    }
+
+    serialized := serializeMarket(market)
+    market.Signature = ed25519.Sign(c.identity.SigningPrivateKey, serialized)
+    market.ID = sha256Hash(serialized)
+
+    c.session.AddDiscoveredMarket(market)
+
+    marketData, _ := json.Marshal(market)
+    if err := c.dht.StoreValue("market:"+market.ID, marketData); err != nil {
+        fmt.Printf("Warning: Failed to store market in DHT: %v\n", err)
+    }
+
+    fmt.Printf("\n✅ Market created successfully!\n")
+    fmt.Printf("   Market ID: %s\n", market.ID)
+    fmt.Printf("   Resolution block: %d (current: %d)\n", blockHeight, currentHeight)
+}
+
+func (c *PredictionClient) browseMarkets() {
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    ACTIVE MARKETS                            │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+
+    markets := c.session.GetDiscoveredMarkets()
+    if len(markets) == 0 {
+        fmt.Println("\nNo markets found. Use option 10 to add peers and discover markets.")
+        return
+    }
+
+    for i, m := range markets {
+        remaining := float64(m.MaxLiability-m.UsedLiability) / 1e12
+        fmt.Printf("\n%d. %s\n", i+1, m.EventName)
+        fmt.Printf("   Odds: %d:%d | Liability left: %.4f XMR\n", m.OddsNumerator, m.OddsDenominator, remaining)
+        fmt.Printf("   Resolves: block %d\n", m.ResolutionBlock)
+        fmt.Printf("   ID: %s\n", m.ID[:16])
+    }
+
+    fmt.Print("\nSelect market to bet on (#): ")
+    choiceStr, _ := c.reader.ReadString('\n')
+    idx, err := strconv.Atoi(strings.TrimSpace(choiceStr))
+    if err != nil || idx < 1 || idx > len(markets) {
+        fmt.Println("Invalid selection")
+        return
+    }
+
+    c.placeBet(markets[idx-1])
+}
+
+func (c *PredictionClient) placeBet(market *Market) {
+    remaining := market.MaxLiability - market.UsedLiability
+    fmt.Printf("\nRemaining liability: %.4f XMR\n", float64(remaining)/1e12)
+
+    fmt.Print("\nYour payout subaddress: ")
+    payoutAddr, _ := c.reader.ReadString('\n')
+    payoutAddr = strings.TrimSpace(payoutAddr)
+
+    fmt.Print("Outcome (yes/no): ")
+    outcomeStr, _ := c.reader.ReadString('\n')
+    outcome := strings.TrimSpace(outcomeStr) == "yes"
+
+    fmt.Print("Wager amount (XMR): ")
+    wagerStr, _ := c.reader.ReadString('\n')
+    wagerXMR, err := strconv.ParseFloat(strings.TrimSpace(wagerStr), 64)
+    if err != nil {
+        fmt.Printf("Invalid wager: %v\n", err)
+        return
+    }
+    wagerAmount := uint64(wagerXMR * 1e12)
+
+    if wagerAmount < MinBetSizePiconero {
+        fmt.Printf("Minimum bet is %.4f XMR\n", float64(MinBetSizePiconero)/1e12)
+        return
+    }
+
+    if wagerAmount > remaining {
+        fmt.Println("Wager exceeds remaining liability")
+        return
+    }
+
+    payout := wagerAmount * market.OddsNumerator / market.OddsDenominator
+    afterFees := payout * (100 - DeveloperFeePercent - OracleFeePercent) / 100
+    devFee := payout * DeveloperFeePercent / 100
+
+    fmt.Printf("\nBet Summary:\n")
+    fmt.Printf("  Wager: %.4f XMR\n", float64(wagerAmount)/1e12)
+    fmt.Printf("  Payout after fees: %.4f XMR\n", float64(afterFees)/1e12)
+    fmt.Printf("  Dev fee (2%%): %.4f XMR\n", float64(devFee)/1e12)
+
+    fmt.Print("\nConfirm bet? (yes/no): ")
+    confirm, _ := c.reader.ReadString('\n')
+    if strings.TrimSpace(confirm) != "yes" {
+        return
+    }
+
+    depositIdx, depositAddr, err := c.monero.GenerateSubaddress(0, fmt.Sprintf("Bet for %s", market.EventName[:20]))
+    if err != nil {
+        fmt.Printf("Failed to generate deposit address: %v\n", err)
+        return
+    }
+
+    fmt.Printf("\n💰 Send exactly %.4f XMR to:\n%s\n", float64(wagerAmount)/1e12, depositAddr)
+    fmt.Print("Press ENTER after sending...")
+    c.reader.ReadString('\n')
+
+    var depositTxID string
+    requiredConfs := ConfirmationThresholdSmall
+    if wagerAmount >= ConfirmationAmountThreshold {
+        requiredConfs = ConfirmationThresholdLarge
+    }
+
+    fmt.Print("Waiting for confirmation")
+    for i := 0; i < 120; i++ {
+        txID, amount, confs, err := c.monero.CheckDeposit(depositIdx, wagerAmount)
+        if err == nil && amount >= wagerAmount && confs >= requiredConfs {
+            depositTxID = txID
+            break
+        }
+        fmt.Print(".")
+        time.Sleep(2 * time.Second)
+    }
+    fmt.Println()
+
+    if depositTxID == "" {
+        fmt.Println("Deposit not confirmed after 240 seconds")
+        return
+    }
+    fmt.Println("Deposit confirmed!")
+
+    currentHeight, _ := currentMoneroBlockHeight()
+
+    bet := &BetOffer{
+        MarketID:               market.ID,
+        ChosenOutcome:          outcome,
+        WagerAmount:            wagerAmount,
+        PayoutSubaddress:       payoutAddr,
+        DepositTxID:            depositTxID,
+        DepositSubaddressIndex: depositIdx,
+        BettorSigningKey:       c.identity.SigningPublicKey,
+        BettorI2PDest:          c.i2p.GetDestination(),
+        Nonce:                  uint64(time.Now().UnixNano()),
+        CreationBlock:          currentHeight,
+        GenesisHash:            GenesisHash,
+        Status:                 "pending",
+    }
+
+    serialized := serializeBetOffer(bet)
+    bet.Signature = ed25519.Sign(c.identity.SigningPrivateKey, serialized)
+    bet.ID = sha256Hash(serialized)
+
+    c.session.AddSeenBetOffer(bet)
+
+    betData, _ := json.Marshal(bet)
+    if err := c.dht.StoreValue("bet:"+market.ID+":"+bet.ID, betData); err != nil {
+        fmt.Printf("Warning: Failed to store bet in DHT: %v\n", err)
+    }
+
+    fmt.Printf("\n✅ Bet placed! Offer ID: %s\n", bet.ID[:16])
+    fmt.Println("Waiting for market maker acceptance...")
+
+    go c.pollForAcceptance(bet.ID)
+}
+
+func (c *PredictionClient) pollForAcceptance(betID string) {
+    for i := 0; i < 60; i++ {
+        time.Sleep(2 * time.Second)
+        if acc, ok := c.session.GetAcceptance(betID); ok {
+            fmt.Printf("\n🎉 Bet ACCEPTED by maker %x...\n", acc.MakerKey[:8])
+            if bet, ok := c.session.SeenBetOffers[betID]; ok {
+                bet.Status = "accepted"
+                if market, ok := c.session.DiscoveredMarkets[bet.MarketID]; ok {
+                    market.UsedLiability += bet.WagerAmount
+                }
+            }
+            return
+        }
+    }
+    fmt.Printf("\n⏰ Bet %s still pending. Maker may accept later.\n", betID[:16])
+}
+
+func (c *PredictionClient) checkMyBets() {
+    var myBets []*BetOffer
+    for _, bet := range c.session.SeenBetOffers {
+        if string(bet.BettorSigningKey) == string(c.identity.SigningPublicKey) {
+            myBets = append(myBets, bet)
+        }
+    }
+    
+    if len(myBets) == 0 {
+        fmt.Println("\nNo bets found.")
+        return
+    }
+
+    fmt.Println("\n--- YOUR BETS ---")
+    for _, bet := range myBets {
+        market, ok := c.session.DiscoveredMarkets[bet.MarketID]
+        marketName := "Unknown"
+        if ok {
+            marketName = market.EventName
+        }
+        fmt.Printf("\nBet on: %s\n", marketName)
+        fmt.Printf("  Outcome: %v | Wager: %.4f XMR\n", bet.ChosenOutcome, float64(bet.WagerAmount)/1e12)
+        fmt.Printf("  Status: %s\n", bet.Status)
+    }
+}
+
+func (c *PredictionClient) proposeResolution() {
+    var myMarkets []*Market
+    for _, m := range c.session.DiscoveredMarkets {
+        if string(m.MakerSigningKey) == string(c.identity.SigningPublicKey) && !m.Resolved {
+            myMarkets = append(myMarkets, m)
+        }
+    }
+
+    if len(myMarkets) == 0 {
+        fmt.Println("\nNo unresolved markets that you created.")
+        return
+    }
+
+    fmt.Println("\n--- YOUR UNRESOLVED MARKETS ---")
+    for i, m := range myMarkets {
+        fmt.Printf("%d. %s (resolves at block %d)\n", i+1, m.EventName, m.ResolutionBlock)
+    }
+
+    fmt.Print("\nSelect market to resolve: ")
+    choiceStr, _ := c.reader.ReadString('\n')
+    idx, err := strconv
  
