@@ -2524,5 +2524,246 @@ func (c *PredictionClient) proposeResolution() {
 
     fmt.Print("\nSelect market to resolve: ")
     choiceStr, _ := c.reader.ReadString('\n')
-    idx, err := strconv
+        idx, err := strconv.Atoi(strings.TrimSpace(choiceStr))
+    if err != nil || idx < 1 || idx > len(myMarkets) {
+        fmt.Println("Invalid selection")
+        return
+    }
+
+    market := myMarkets[idx-1]
+
+    currentHeight, err := currentMoneroBlockHeight()
+    if err != nil {
+        fmt.Printf("Failed to get current block height: %v\n", err)
+        return
+    }
+    
+    if currentHeight < market.ResolutionBlock {
+        fmt.Printf("Cannot resolve yet. Resolution block %d (current: %d)\n", market.ResolutionBlock, currentHeight)
+        return
+    }
+
+    if err := c.resolutionSys.ProposeResolution(market); err != nil {
+        fmt.Printf("Failed to propose resolution: %v\n", err)
+    }
+}
+
+func (c *PredictionClient) fileDispute() {
+    fmt.Println("\n--- FILE DISPUTE ---")
+    fmt.Print("Market ID: ")
+    marketID, _ := c.reader.ReadString('\n')
+    marketID = strings.TrimSpace(marketID)
+
+    market, ok := c.session.DiscoveredMarkets[marketID]
+    if !ok {
+        fmt.Println("Market not found")
+        return
+    }
+
+    if !market.Resolved {
+        fmt.Println("Market not resolved yet")
+        return
+    }
+
+    fmt.Printf("Market: %s\n", market.EventName)
+    fmt.Printf("Resolution: %v\n", *market.ResolutionOutcome)
+    fmt.Print("Do you dispute this resolution? (yes/no): ")
+    confirm, _ := c.reader.ReadString('\n')
+    if strings.TrimSpace(confirm) != "yes" {
+        return
+    }
+
+    dispute := &Dispute{
+        ID:             sha256Hash([]byte(fmt.Sprintf("%s|%s|%d", marketID, c.identity.SigningPublicKey, time.Now().Unix()))),
+        MarketID:       marketID,
+        ResolutionHash: sha256Hash([]byte(fmt.Sprintf("%s|%t", marketID, *market.ResolutionOutcome))),
+        BettorKey:      c.identity.SigningPublicKey,
+        Timestamp:      uint64(time.Now().Unix()),
+        Status:         "pending",
+    }
+
+    c.session.Disputes[dispute.ID] = dispute
+
+    disputeData, _ := json.Marshal(dispute)
+    if err := c.dht.StoreValue("dispute:"+dispute.ID, disputeData); err != nil {
+        fmt.Printf("Warning: Failed to store dispute in DHT: %v\n", err)
+    }
+
+    fmt.Println("Dispute recorded.")
+}
+
+func (c *PredictionClient) fileComplaint() {
+    fmt.Println("\n--- FILE NON-RESOLUTION COMPLAINT ---")
+    fmt.Print("Market ID: ")
+    marketID, _ := c.reader.ReadString('\n')
+    marketID = strings.TrimSpace(marketID)
+
+    market, ok := c.session.DiscoveredMarkets[marketID]
+    if !ok {
+        fmt.Println("Market not found")
+        return
+    }
+
+    if market.Resolved {
+        fmt.Println("Market already resolved")
+        return
+    }
+
+    fmt.Print("File complaint? (yes/no): ")
+    confirm, _ := c.reader.ReadString('\n')
+    if strings.TrimSpace(confirm) != "yes" {
+        return
+    }
+
+    var userBet *BetOffer
+    for _, bet := range c.session.SeenBetOffers {
+        if bet.MarketID == marketID && string(bet.BettorSigningKey) == string(c.identity.SigningPublicKey) {
+            userBet = bet
+            break
+        }
+    }
+
+    if userBet == nil {
+        fmt.Println("No bet found from you on this market")
+        return
+    }
+
+    complaint := &Complaint{
+        ID:         sha256Hash([]byte(fmt.Sprintf("%s|%s|%d", marketID, c.identity.SigningPublicKey, time.Now().Unix()))),
+        MarketID:   marketID,
+        BetOfferID: userBet.ID,
+        BettorKey:  c.identity.SigningPublicKey,
+        Timestamp:  uint64(time.Now().Unix()),
+    }
+
+    c.session.Complaints[complaint.ID] = complaint
+
+    fmt.Printf("\n💰 Bond of %.4f XMR is claimable\n", float64(BondAmountPiconero)/1e12)
+    fmt.Println("Complaint filed.")
+}
+
+func (c *PredictionClient) announceOracle() {
+    fmt.Println("\n--- ANNOUNCE AS ORACLE ---")
+    fmt.Printf("Minimum stake: %.4f XMR\n", float64(MinOracleStakePiconero)/1e12)
+    fmt.Print("Stake amount (XMR): ")
+    stakeStr, _ := c.reader.ReadString('\n')
+    stakeXMR, err := strconv.ParseFloat(strings.TrimSpace(stakeStr), 64)
+    if err != nil {
+        fmt.Printf("Invalid amount: %v\n", err)
+        return
+    }
+
+    stakeAmount := uint64(stakeXMR * 1e12)
+    if stakeAmount < MinOracleStakePiconero {
+        fmt.Printf("Stake must be at least %.4f XMR\n", float64(MinOracleStakePiconero)/1e12)
+        return
+    }
+
+    if err := c.oracleSys.AnnounceAsOracle(stakeAmount); err != nil {
+        fmt.Printf("Failed to announce as oracle: %v\n", err)
+        return
+    }
+
+    fmt.Println("\n✅ Announced as oracle! Heartbeat system started.")
+}
+
+func (c *PredictionClient) showIdentity() {
+    oracleStatus := ""
+    if c.identity.IsOracle {
+        oracleStatus = " | ORACLE"
+    }
+    
+    fmt.Println("\n┌────────────────── YOUR IDENTITY ──────────────────┐")
+    fmt.Printf("│ Signing Key:   %x...%s\n", c.identity.SigningPublicKey[:8], oracleStatus)
+    fmt.Printf("│ I2P Address:   %s...\n", c.i2p.GetBase32Address()[:20])
+    fmt.Printf("│ DHT Node ID:   %x...\n", c.dht.NodeID[:8])
+    fmt.Printf("│ Active Markets: %d\n", len(c.identity.ActiveMarkets))
+    fmt.Printf("│ Pending Bets:   %d\n", len(c.identity.PendingBets))
+    fmt.Println("├────────────────────────────────────────────────────┤")
+    fmt.Println("│ Identity file: identity.enc (keep this safe!)       │")
+    fmt.Println("│                                                    │")
+    fmt.Println("│ To recover: use the same password and identity.enc │")
+    fmt.Println("└────────────────────────────────────────────────────┘")
+}
+
+func (c *PredictionClient) checkBalance() {
+    balance, unlocked, err := c.monero.GetBalance()
+    if err != nil {
+        fmt.Printf("Failed to get balance: %v\n", err)
+        return
+    }
+
+    fmt.Printf("\n💰 Wallet Balance:\n")
+    fmt.Printf("   Total balance:   %.4f XMR\n", float64(balance)/1e12)
+    fmt.Printf("   Unlocked:        %.4f XMR\n", float64(unlocked)/1e12)
+}
+
+// ========== MAIN ==========
+
+func main() {
+    fmt.Println("╔════════════════════════════════════════════════════════════════╗")
+    fmt.Println("║                    PREDICTION MARKET CLIENT                    ║")
+    fmt.Println("╚════════════════════════════════════════════════════════════════╝")
+    fmt.Println()
+    
+    dbPath := "./prediction_data"
+    
+    identityPath := filepath.Join(dbPath, "identity.enc")
+    var hasIdentity bool
+    if _, err := os.Stat(identityPath); err == nil {
+        hasIdentity = true
+    }
+    
+    var choice string
+    var isOracle bool = false
+    
+    if hasIdentity {
+        fmt.Println("Existing identity found.")
+        fmt.Println("  1. Load existing identity")
+        fmt.Println("  2. Create new identity (old will remain as backup)")
+        fmt.Print("\nChoice: ")
+        scanner := bufio.NewScanner(os.Stdin)
+        scanner.Scan()
+        choice = scanner.Text()
+    } else {
+        fmt.Println("No existing identity found. Creating new identity...")
+        choice = "2"
+    }
+    
+    fmt.Print("Enter password to encrypt/decrypt your identity: ")
+    scanner := bufio.NewScanner(os.Stdin)
+    scanner.Scan()
+    password := scanner.Text()
+    
+    if len(password) < 8 {
+        fmt.Println("Password must be at least 8 characters")
+        os.Exit(1)
+    }
+    
+    if choice == "2" {
+        fmt.Print("Do you want to register as an oracle? (requires XMR stake) (yes/no): ")
+        oracleChoiceStr, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+        isOracle = strings.TrimSpace(oracleChoiceStr) == "yes"
+    }
+    
+    createNew := choice == "2"
+    
+    fmt.Println("\nStarting client...")
+    fmt.Println("(All session data - discovered markets, peer lists - will be deleted on exit)")
+    fmt.Println("Only your identity and active markets/pending bets are saved.")
+    fmt.Println()
+    
+    client, err := NewPredictionClient(dbPath, password, createNew, isOracle)
+    if err != nil {
+        fmt.Printf("FATAL: %v\n", err)
+        fmt.Println("\nTroubleshooting:")
+        fmt.Println("  - Is XMR_RPC_USER and XMR_RPC_PASS set?")
+        fmt.Println("  - Is monero-wallet-rpc running with --rpc-login?")
+        fmt.Println("  - Is monerod running with RPC enabled?")
+        fmt.Println("  - Is I2P router running with SAM enabled?")
+        os.Exit(1)
+    }
+    
+    client.Run()
+}
  
