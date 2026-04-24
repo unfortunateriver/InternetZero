@@ -680,5 +680,690 @@ func (s *SessionData) AddOracleVote(v *OracleVote) {
 func (s *SessionData) GetOracleVotes(proposalID string) []*OracleVote {
     s.mu.RLock()
     defer s.mu.RUnlock()
-    var list []*OracleVote
+        var list []*OracleVote
+    for _, v := range s.OracleVotes {
+        if v.ProposalID == proposalID {
+            list = append(list, v)
+        }
+    }
+    return list
+}
+
+func (s *SessionData) AddOracleRegistration(oa *OracleAnnouncement) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.OracleRegistrations[oa.ID] = oa
+}
+
+func (s *SessionData) GetOracleRegistrations() []*OracleAnnouncement {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    var list []*OracleAnnouncement
+    for _, o := range s.OracleRegistrations {
+        list = append(list, o)
+    }
+    return list
+}
+
+func (s *SessionData) UpdateOracleHeartbeat(status *OracleStatus) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    s.OracleHeartbeats[status.OracleID] = status
+}
+
+func (s *SessionData) GetActiveOracles() []*OracleStatus {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    var active []*OracleStatus
+    now := uint64(time.Now().Unix())
+    for _, status := range s.OracleHeartbeats {
+        if status.Online && (now-status.LastHeartbeat) < uint64(HeartbeatTTL.Seconds()) {
+            active = append(active, status)
+        }
+    }
+    return active
+}
+
+func (s *SessionData) StoreValue(key string, value []byte) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    // Parse and store based on key type
+    if strings.HasPrefix(key, "market:") {
+        var m Market
+        json.Unmarshal(value, &m)
+        s.DiscoveredMarkets[m.ID] = &m
+    } else if strings.HasPrefix(key, "bet:") {
+        var b BetOffer
+        json.Unmarshal(value, &b)
+        s.SeenBetOffers[b.ID] = &b
+    } else if strings.HasPrefix(key, "acceptance:") {
+        var a Acceptance
+        json.Unmarshal(value, &a)
+        s.Acceptances[a.BetOfferID] = &a
+    } else if strings.HasPrefix(key, "proposal:") {
+        var p ResolutionProposal
+        json.Unmarshal(value, &p)
+        s.ResolutionProposals[p.ID] = &p
+    } else if strings.HasPrefix(key, "vote:") {
+        var v OracleVote
+        json.Unmarshal(value, &v)
+        s.OracleVotes[v.ProposalID+":"+hex.EncodeToString(v.OracleKey[:8])] = &v
+    } else if strings.HasPrefix(key, "oracle:registration:") {
+        var oa OracleAnnouncement
+        json.Unmarshal(value, &oa)
+        s.OracleRegistrations[oa.ID] = &oa
+    } else if strings.HasPrefix(key, "oracle:heartbeat:") {
+        var os OracleStatus
+        json.Unmarshal(value, &os)
+        s.OracleHeartbeats[os.OracleID] = &os
+    }
+}
+
+func (s *SessionData) GetValue(key string) ([]byte, bool) {
+    s.mu.RLock()
+    defer s.mu.RUnlock()
+    // This is simplified - in production would need proper key-based retrieval
+    return nil, false
+}
+
+// ========== KADEMLIA DHT ==========
+
+type KademliaDHT struct {
+    NodeID        []byte
+    Session       *SessionData
+    I2P           *I2PNetwork
+    ctx           context.Context
+    cancel        context.CancelFunc
+    rateLimiter   *RateLimiter
+    mu            sync.RWMutex
+}
+
+func NewKademliaDHT(nodeID []byte, session *SessionData, i2p *I2PNetwork) *KademliaDHT {
+    ctx, cancel := context.WithCancel(context.Background())
+
+    dht := &KademliaDHT{
+        NodeID:       nodeID,
+        Session:      session,
+        I2P:          i2p,
+        ctx:          ctx,
+        cancel:       cancel,
+        rateLimiter:  NewRateLimiter(RateLimitInterval, RateLimitMaxQueries),
+    }
+
+    return dht
+}
+
+func (d *KademliaDHT) Start() error {
+    if err := d.I2P.StartListener(func(conn net.Conn) {
+        d.handleDHTMessage(conn)
+    }); err != nil {
+        return err
+    }
+
+    go d.refreshLoop()
+    go d.cleanupLoop()
+
+    return nil
+}
+
+func (d *KademliaDHT) getBucketIndex(target []byte) int {
+    for i := 0; i < len(d.NodeID) && i < len(target); i++ {
+        xor := d.NodeID[i] ^ target[i]
+        if xor == 0 {
+            continue
+        }
+        for bit := 7; bit >= 0; bit-- {
+            if xor&(1<<uint(bit)) != 0 {
+                return i*8 + (7 - bit)
+            }
+        }
+    }
+    return 0
+}
+
+func (d *KademliaDHT) AddPeer(id []byte, i2pDest string) {
+    if !isValidI2PAddress(i2pDest) {
+        return
+    }
+    
+    bucketIdx := d.getBucketIndex(id)
+    node := &PeerNode{
+        ID:       id,
+        I2PDest:  i2pDest,
+        LastSeen: time.Now(),
+    }
+    d.Session.RoutingTable[bucketIdx].Add(node)
+}
+
+func (d *KademliaDHT) FindClosest(target []byte, count int) []*PeerNode {
+    bucketIdx := d.getBucketIndex(target)
+    var closest []*PeerNode
+
+    for offset := 0; offset < NodeIDBits && len(closest) < count; offset++ {
+        idx := bucketIdx + offset
+        if idx < NodeIDBits {
+            for _, node := range d.Session.RoutingTable[idx].GetClosest(count - len(closest)) {
+                closest = append(closest, node)
+            }
+        }
+
+        idx = bucketIdx - offset
+        if idx >= 0 && idx != bucketIdx+offset {
+            for _, node := range d.Session.RoutingTable[idx].GetClosest(count - len(closest)) {
+                closest = append(closest, node)
+            }
+        }
+    }
+
+    return closest
+}
+
+func (d *KademliaDHT) IterativeFindNode(target []byte) ([]*PeerNode, error) {
+    shortlist := d.FindClosest(target, KademliaAlpha)
+    if len(shortlist) == 0 {
+        return nil, fmt.Errorf("no known peers")
+    }
+
+    var closest []*PeerNode
+    queried := make(map[string]bool)
+
+    for len(shortlist) > 0 && len(closest) < KademliaBucketSize {
+        var toQuery []*PeerNode
+        for _, node := range shortlist {
+            if !queried[node.I2PDest] {
+                toQuery = append(toQuery, node)
+                queried[node.I2PDest] = true
+                if len(toQuery) >= KademliaAlpha {
+                    break
+                }
+            }
+        }
+
+        if len(toQuery) == 0 {
+            break
+        }
+
+        type result struct {
+            nodes []*PeerNode
+            err   error
+        }
+        results := make(chan result, len(toQuery))
+
+        for _, node := range toQuery {
+            go func(n *PeerNode) {
+                msg := struct {
+                    Type      string `json:"type"`
+                    SenderID  []byte `json:"sender_id"`
+                    SenderDest string `json:"sender_dest"`
+                    Target    []byte `json:"target"`
+                }{
+                    Type:      "FIND_NODE",
+                    SenderID:  d.NodeID,
+                    SenderDest: d.I2P.GetDestination(),
+                    Target:    target,
+                }
+
+                var response struct {
+                    Type  string      `json:"type"`
+                    Nodes []*PeerNode `json:"nodes"`
+                }
+
+                conn, err := d.I2P.DialPeer(n.I2PDest)
+                if err != nil {
+                    results <- result{nil, err}
+                    return
+                }
+                defer conn.Close()
+
+                if err := json.NewEncoder(conn).Encode(msg); err != nil {
+                    results <- result{nil, err}
+                    return
+                }
+
+                if err := json.NewDecoder(conn).Decode(&response); err != nil {
+                    results <- result{nil, err}
+                    return
+                }
+
+                results <- result{response.Nodes, nil}
+            }(node)
+        }
+
+        for i := 0; i < len(toQuery); i++ {
+            res := <-results
+            if res.err != nil {
+                continue
+            }
+
+            for _, newNode := range res.nodes {
+                d.AddPeer(newNode.ID, newNode.I2PDest)
+            }
+
+            shortlist = d.mergeShortlist(shortlist, res.nodes, target)
+        }
+
+        closest = d.FindClosest(target, KademliaBucketSize)
+    }
+
+    return closest, nil
+}
+
+func (d *KademliaDHT) mergeShortlist(current []*PeerNode, newNodes []*PeerNode, target []byte) []*PeerNode {
+    all := append(current, newNodes...)
+    sort.Slice(all, func(i, j int) bool {
+        return all[i].Distance(target) < all[j].Distance(target)
+    })
+
+    seen := make(map[string]bool)
+    var result []*PeerNode
+    for _, node := range all {
+        if !seen[node.I2PDest] {
+            seen[node.I2PDest] = true
+            result = append(result, node)
+        }
+    }
+
+    if len(result) > KademliaBucketSize {
+        result = result[:KademliaBucketSize]
+    }
+    return result
+}
+
+func (d *KademliaDHT) StoreValue(key string, value []byte) error {
+    targetID := sha256HashToID(key)
+    closest, err := d.IterativeFindNode(targetID)
+    if err != nil {
+        return err
+    }
+
+    stored := 0
+    for _, node := range closest {
+        msg := struct {
+            Type      string `json:"type"`
+            SenderID  []byte `json:"sender_id"`
+            SenderDest string `json:"sender_dest"`
+            Key       string `json:"key"`
+            Value     []byte `json:"value"`
+        }{
+            Type:      "STORE",
+            SenderID:  d.NodeID,
+            SenderDest: d.I2P.GetDestination(),
+            Key:       key,
+            Value:     value,
+        }
+
+        conn, err := d.I2P.DialPeer(node.I2PDest)
+        if err != nil {
+            continue
+        }
+        json.NewEncoder(conn).Encode(msg)
+        conn.Close()
+        stored++
+    }
+
+    if stored == 0 {
+        return fmt.Errorf("failed to store on any node")
+    }
+    return nil
+}
+
+func (d *KademliaDHT) GetValue(key string) ([]byte, error) {
+    targetID := sha256HashToID(key)
+    closest, err := d.IterativeFindNode(targetID)
+    if err != nil {
+        return nil, err
+    }
+
+    type result struct {
+        value []byte
+        node  *PeerNode
+    }
+    results := make(chan result, len(closest))
+
+    for _, node := range closest {
+        go func(n *PeerNode) {
+            msg := struct {
+                Type      string `json:"type"`
+                SenderID  []byte `json:"sender_id"`
+                SenderDest string `json:"sender_dest"`
+                Key       string `json:"key"`
+            }{
+                Type:      "FIND_VALUE",
+                SenderID:  d.NodeID,
+                SenderDest: d.I2P.GetDestination(),
+                Key:       key,
+            }
+
+            var response struct {
+                Type  string `json:"type"`
+                Value []byte `json:"value"`
+                Nodes []*PeerNode `json:"nodes"`
+            }
+
+            conn, err := d.I2P.DialPeer(n.I2PDest)
+            if err != nil {
+                results <- result{nil, nil}
+                return
+            }
+            defer conn.Close()
+
+            if err := json.NewEncoder(conn).Encode(msg); err != nil {
+                results <- result{nil, nil}
+                return
+            }
+
+            if err := json.NewDecoder(conn).Decode(&response); err != nil {
+                results <- result{nil, nil}
+                return
+            }
+
+            if response.Type == "FIND_VALUE_RESPONSE" && response.Value != nil {
+                results <- result{response.Value, n}
+            } else {
+                results <- result{nil, nil}
+            }
+        }(node)
+    }
+
+    for i := 0; i < len(closest); i++ {
+        res := <-results
+        if res.value != nil {
+            return res.value, nil
+        }
+    }
+
+    return nil, fmt.Errorf("value not found")
+}
+
+func (d *KademliaDHT) GetValuesWithPrefix(prefix string) (map[string][]byte, error) {
+    // This would iterate through the DHT - simplified for now
+    return make(map[string][]byte), nil
+}
+
+func (d *KademliaDHT) handleDHTMessage(conn net.Conn) {
+    defer conn.Close()
+    
+    remoteAddr := conn.RemoteAddr().String()
+    if !d.rateLimiter.Allow(remoteAddr) {
+        return
+    }
+
+    var msg struct {
+        Type       string          `json:"type"`
+        SenderID   []byte          `json:"sender_id"`
+        SenderDest string          `json:"sender_dest"`
+        Target     []byte          `json:"target,omitempty"`
+        Key        string          `json:"key,omitempty"`
+        Value      []byte          `json:"value,omitempty"`
+        Nodes      []*PeerNode     `json:"nodes,omitempty"`
+    }
+
+    decoder := json.NewDecoder(conn)
+    if err := decoder.Decode(&msg); err != nil {
+        return
+    }
+
+    if msg.SenderID != nil && isValidI2PAddress(msg.SenderDest) {
+        d.AddPeer(msg.SenderID, msg.SenderDest)
+    }
+
+    switch msg.Type {
+    case "PING":
+        response := struct {
+            Type        string `json:"type"`
+            ResponderID []byte `json:"responder_id"`
+        }{
+            Type:        "PONG",
+            ResponderID: d.NodeID,
+        }
+        json.NewEncoder(conn).Encode(response)
+
+    case "FIND_NODE":
+        nodes := d.FindClosest(msg.Target, KademliaBucketSize)
+        response := struct {
+            Type  string      `json:"type"`
+            Nodes []*PeerNode `json:"nodes"`
+        }{
+            Type:  "FIND_NODE_RESPONSE",
+            Nodes: nodes,
+        }
+        json.NewEncoder(conn).Encode(response)
+
+    case "FIND_VALUE":
+        if data, ok := d.Session.GetValue(msg.Key); ok {
+            response := struct {
+                Type  string `json:"type"`
+                Value []byte `json:"value"`
+            }{
+                Type:  "FIND_VALUE_RESPONSE",
+                Value: data,
+            }
+            json.NewEncoder(conn).Encode(response)
+        } else {
+            nodes := d.FindClosest(sha256HashToID(msg.Key), KademliaBucketSize)
+            response := struct {
+                Type  string      `json:"type"`
+                Nodes []*PeerNode `json:"nodes"`
+            }{
+                Type:  "FIND_NODE_RESPONSE",
+                Nodes: nodes,
+            }
+            json.NewEncoder(conn).Encode(response)
+        }
+
+    case "STORE":
+        d.Session.StoreValue(msg.Key, msg.Value)
+    }
+}
+
+func (d *KademliaDHT) refreshLoop() {
+    ticker := time.NewTicker(30 * time.Minute)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-d.ctx.Done():
+            return
+        case <-ticker.C:
+            bucketIdx := rand.Intn(NodeIDBits)
+            if d.Session.RoutingTable[bucketIdx].Len() > 0 {
+                nodes := d.Session.RoutingTable[bucketIdx].GetClosest(1)
+                if len(nodes) > 0 {
+                    d.IterativeFindNode(nodes[0].ID)
+                }
+            }
+        }
+    }
+}
+
+func (d *KademliaDHT) cleanupLoop() {
+    ticker := time.NewTicker(PeerCleanupInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-d.ctx.Done():
+            return
+        case <-ticker.C:
+            removed := 0
+            for i := 0; i < NodeIDBits; i++ {
+                removed += d.Session.RoutingTable[i].RemoveStalePeers()
+            }
+            if removed > 0 {
+                fmt.Printf("Cleaned up %d stale peers\n", removed)
+            }
+        }
+    }
+}
+
+func (d *KademliaDHT) GetPeerCount() int {
+    count := 0
+    for i := 0; i < NodeIDBits; i++ {
+        count += d.Session.RoutingTable[i].Len()
+    }
+    return count
+}
+
+func (d *KademliaDHT) Stop() {
+    d.cancel()
+}
+
+func sha256HashToID(key string) []byte {
+    hash := sha256.Sum256([]byte(key))
+    return hash[:20]
+}
+
+// ========== UTILITY FUNCTIONS ==========
+
+func mustParseSSHKey(b64key string) []byte {
+    decoded, err := base64.StdEncoding.DecodeString(b64key)
+    if err != nil {
+        panic(fmt.Sprintf("Failed to decode developer key: %v", err))
+    }
+    if len(decoded) >= 32 {
+        return decoded[len(decoded)-32:]
+    }
+    panic("Developer key too short")
+}
+
+func sha256Hash(data []byte) string {
+    hash := sha256.Sum256(data)
+    return hex.EncodeToString(hash[:])
+}
+
+func serializeMarket(m *Market) []byte {
+    return []byte(fmt.Sprintf("%s|%s|%s|%d|%d|%d|%d|%s|%x|%s|%d|%d|%s",
+        m.ID, m.EventName, m.EventDescription, m.ResolutionBlock,
+        m.OddsNumerator, m.OddsDenominator, m.MaxLiability, m.BondTxID,
+        m.MakerSigningKey, m.MakerI2PDest, m.Nonce, m.CreationBlock, m.GenesisHash))
+}
+
+func serializeBetOffer(b *BetOffer) []byte {
+    return []byte(fmt.Sprintf("%s|%s|%t|%d|%s|%s|%d|%x|%s|%d|%d|%s",
+        b.ID, b.MarketID, b.ChosenOutcome, b.WagerAmount, b.PayoutSubaddress,
+        b.DepositTxID, b.DepositSubaddressIndex, b.BettorSigningKey, b.BettorI2PDest,
+        b.Nonce, b.CreationBlock, b.GenesisHash))
+}
+
+func currentMoneroBlockHeight() (uint64, error) {
+    reqBody := []byte(`{"jsonrpc":"2.0","id":"0","method":"get_block_count","params":[]}`)
+    resp, err := http.Post("http://127.0.0.1:18081/json_rpc", "application/json", bytes.NewReader(reqBody))
+    if err != nil {
+        return 0, fmt.Errorf("failed to connect to monerod: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var rpcResp struct {
+        Result struct {
+            Count uint64 `json:"count"`
+        } `json:"result"`
+        Error struct {
+            Code    int    `json:"code"`
+            Message string `json:"message"`
+        } `json:"error"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+        return 0, fmt.Errorf("failed to decode monerod response: %w", err)
+    }
+    if rpcResp.Error.Code != 0 {
+        return 0, fmt.Errorf("monerod RPC error: %s", rpcResp.Error.Message)
+    }
+    return rpcResp.Result.Count, nil
+}
+
+// ========== MONERO CLIENT ==========
+
+type MoneroClient struct {
+    client   *walletrpc.Client
+    ctx      context.Context
+    username string
+    password string
+    seed     string
+}
+
+func NewMoneroClient(username, password, seed string) (*MoneroClient, error) {
+    ctx := context.Background()
+
+    httpClient := &http.Client{
+        Transport: httpdigest.New(username, password),
+    }
+
+    client := walletrpc.New(walletrpc.Config{
+        Address: "http://127.0.0.1:18082/json_rpc",
+        Client:  httpClient,
+    })
+
+    if seed != "" {
+        fmt.Println("Restoring wallet from seed...")
+    }
+
+    _, err := client.GetBalance(ctx, &walletrpc.GetBalanceRequest{
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("cannot connect to monero-wallet-rpc: %w\n"+
+            "Please run: monero-wallet-rpc --wallet-file wallet.bin --rpc-bind-port 18082 --rpc-login %s:***\n", err, username)
+    }
+
+    return &MoneroClient{
+        client:   client,
+        ctx:      ctx,
+        username: username,
+        password: password,
+        seed:     seed,
+    }, nil
+}
+
+func (m *MoneroClient) GenerateSubaddress(accountIndex uint32, label string) (uint32, string, error) {
+    resp, err := m.client.CreateAddress(m.ctx, &walletrpc.CreateAddressRequest{
+        AccountIndex: accountIndex,
+        Label:        label,
+    })
+    if err != nil {
+        return 0, "", fmt.Errorf("failed to create address: %w", err)
+    }
+    return resp.AddressIndex, resp.Address, nil
+}
+
+func (m *MoneroClient) CheckDeposit(subaddressIndex uint32, expectedAmount uint64) (string, uint64, int, error) {
+    transfers, err := m.client.GetTransfers(m.ctx, &walletrpc.GetTransfersRequest{
+        In:           true,
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return "", 0, 0, fmt.Errorf("failed to get transfers: %w", err)
+    }
+
+    for _, tx := range transfers.In {
+        if tx.SubaddrIndex.Minor == subaddressIndex {
+            daemonHeight, err := currentMoneroBlockHeight()
+            if err != nil {
+                return tx.TxID, tx.Amount, 0, nil
+            }
+            confirmations := int(daemonHeight - tx.Height)
+            return tx.TxID, tx.Amount, confirmations, nil
+        }
+    }
+    return "", 0, 0, nil
+}
+
+func (m *MoneroClient) SendPayout(address string, amount uint64) (string, error) {
+    resp, err := m.client.Transfer(m.ctx, &walletrpc.TransferRequest{
+        Destinations: []walletrpc.Destination{
+            {Address: address, Amount: amount},
+        },
+        AccountIndex: 0,
+        Priority:     walletrpc.PriorityUnimportant,
+    })
+    if err != nil {
+        return "", fmt.Errorf("failed to send payout: %w", err)
+    }
+    return resp.TxHash, nil
+}
+
+func (m *MoneroClient) SendDeveloperFee(amount uint64) (string, error) {
+    if amount == 0 {
+        return "", nil
+    }
+    return m.SendPayout(DeveloperAd
  
