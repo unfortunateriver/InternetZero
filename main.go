@@ -1424,4 +1424,609 @@ func (m *MoneroClient) SendDeveloperFee(amount uint64) (string, error) {
 }
 
 func (m *MoneroClient) GetBalance() (uint64, uint64, error) {
-    resp, err :=
+    resp, err := m.client.GetBalance(m.ctx, &walletrpc.GetBalanceRequest{
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return 0, 0, err
+    }
+    return resp.Balance, resp.UnlockedBalance, nil
+}
+
+// ========== I2P NETWORK ==========
+
+type I2PNetwork struct {
+    sam      *sam3.SAM
+    session  *sam3.StreamSession
+    identity *UserIdentity
+    ctx      context.Context
+    cancel   context.CancelFunc
+    mu       sync.RWMutex
+}
+
+func NewI2PNetwork(identity *UserIdentity) (*I2PNetwork, error) {
+    sam, err := sam3.NewSAM("127.0.0.1:7656")
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to I2P SAM bridge: %w\n"+
+            "Please ensure I2P router is running (i2prouter start or i2pd --sam.enabled=true)", err)
+    }
+
+    var keys *sam3.Keys
+    if identity.I2PPrivateKey != nil && identity.I2PPublicKey != nil {
+        keys = &sam3.Keys{
+            Pub:  identity.I2PPublicKey,
+            Priv: identity.I2PPrivateKey,
+        }
+    } else {
+        keys, err = sam.NewKeys()
+        if err != nil {
+            return nil, fmt.Errorf("failed to generate I2P keys: %w", err)
+        }
+        identity.I2PPublicKey = keys.Pub
+        identity.I2PPrivateKey = keys.Priv
+    }
+
+    session, err := sam.NewStreamSession("prediction-market", keys, sam3.Options{
+        "inbound.length":   "3",
+        "outbound.length":  "3",
+        "inbound.quantity": "3",
+        "outbound.quantity": "3",
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to create I2P session: %w", err)
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    return &I2PNetwork{
+        sam:      sam,
+        session:  session,
+        identity: identity,
+        ctx:      ctx,
+        cancel:   cancel,
+    }, nil
+}
+
+func (i *I2PNetwork) GetDestination() string {
+    return i.session.Dest().String()
+}
+
+func (i *I2PNetwork) GetBase32Address() string {
+    return i.session.Dest().Base32()
+}
+
+func (i *I2PNetwork) DialPeer(dest string) (net.Conn, error) {
+    if !isValidI2PAddress(dest) {
+        return nil, fmt.Errorf("invalid I2P address")
+    }
+    return i.session.Dial(dest)
+}
+
+func (i *I2PNetwork) StartListener(handler func(conn net.Conn)) error {
+    listener, err := i.session.Listen()
+    if err != nil {
+        return fmt.Errorf("failed to create listener: %w", err)
+    }
+
+    go func() {
+        for {
+            select {
+            case <-i.ctx.Done():
+                return
+            default:
+                conn, err := listener.Accept()
+                if err != nil {
+                    continue
+                }
+                go handler(conn)
+            }
+        }
+    }()
+
+    return nil
+}
+
+func (i *I2PNetwork) Stop() {
+    i.cancel()
+}
+
+// ========== ENCRYPTED USER IDENTITY ==========
+
+type UserIdentity struct {
+    SigningPrivateKey ed25519.PrivateKey
+    SigningPublicKey  ed25519.PublicKey
+    I2PPrivateKey     ed25519.PrivateKey
+    I2PPublicKey      ed25519.PublicKey
+    MoneroSeed        string
+}
+
+func NewUserIdentity(dbPath, password, recoveryMnemonic string) (*UserIdentity, error) {
+    identityPath := filepath.Join(dbPath, "identity.enc")
+    saltPath := filepath.Join(dbPath, "identity.salt")
+    
+    if recoveryMnemonic != "" {
+        fmt.Println("Recovery mode: Attempting to restore from mnemonic...")
+    }
+
+    if encData, err := os.ReadFile(identityPath); err == nil {
+        salt, err := os.ReadFile(saltPath)
+        if err != nil {
+            return nil, fmt.Errorf("failed to read identity salt: %w", err)
+        }
+        
+        crypto := NewCryptoHelperWithSalt(password, salt)
+        jsonData, err := crypto.Decrypt(encData)
+        if err != nil {
+            return nil, fmt.Errorf("failed to decrypt identity (wrong password?): %w", err)
+        }
+        
+        var identity UserIdentity
+        if err := json.Unmarshal(jsonData, &identity); err != nil {
+            return nil, err
+        }
+        return &identity, nil
+    }
+
+    pub, priv, err := ed25519.GenerateKey(rand.Reader)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate signing key: %w", err)
+    }
+
+    seedBytes := make([]byte, 32)
+    if _, err := rand.Read(seedBytes); err != nil {
+        return nil, fmt.Errorf("failed to generate seed: %w", err)
+    }
+
+    identity := &UserIdentity{
+        SigningPrivateKey: priv,
+        SigningPublicKey:  pub,
+        MoneroSeed:        hex.EncodeToString(seedBytes),
+    }
+
+    jsonData, err := json.MarshalIndent(identity, "", "  ")
+    if err != nil {
+        return nil, err
+    }
+    
+    crypto, err := NewCryptoHelper(password)
+    if err != nil {
+        return nil, err
+    }
+    
+    encrypted, err := crypto.Encrypt(jsonData)
+    if err != nil {
+        return nil, err
+    }
+    
+    if err := os.WriteFile(identityPath, encrypted, 0600); err != nil {
+        return nil, err
+    }
+    if err := os.WriteFile(saltPath, crypto.salt, 0600); err != nil {
+        return nil, err
+    }
+
+    return identity, nil
+}
+
+// ========== ORACLE SYSTEM ==========
+
+type OracleSystem struct {
+    db       *EncryptedDatabase
+    monero   *MoneroClient
+    identity *UserIdentity
+    i2p      *I2PNetwork
+}
+
+func NewOracleSystem(db *EncryptedDatabase, monero *MoneroClient, identity *UserIdentity, i2p *I2PNetwork) *OracleSystem {
+    return &OracleSystem{
+        db:       db,
+        monero:   monero,
+        identity: identity,
+        i2p:      i2p,
+    }
+}
+
+func (o *OracleSystem) AnnounceAsOracle(stakeAmount uint64) error {
+    idx, addr, err := o.monero.GenerateSubaddress(0, "Oracle Stake")
+    if err != nil {
+        return err
+    }
+
+    fmt.Printf("\nSend %.4f XMR stake to:\n%s\n", float64(stakeAmount)/1e12, addr)
+    fmt.Print("Press ENTER after sending...")
+    bufio.NewReader(os.Stdin).ReadString('\n')
+
+    var stakeTxID string
+    fmt.Print("Waiting for confirmation")
+    for i := 0; i < 60; i++ {
+        txID, amount, confs, err := o.monero.CheckDeposit(idx, stakeAmount)
+        if err == nil && amount >= stakeAmount && confs >= ConfirmationThresholdLarge {
+            stakeTxID = txID
+            break
+        }
+        fmt.Print(".")
+        time.Sleep(2 * time.Second)
+    }
+    fmt.Println()
+
+    if stakeTxID == "" {
+        return fmt.Errorf("stake not confirmed after 120 seconds")
+    }
+
+    height, err := o.monero.GetCurrentBlockHeight()
+    if err != nil {
+        height = 0
+    }
+    announcement := &OracleAnnouncement{
+        ID:            sha256Hash([]byte(stakeTxID)),
+        StakingTxID:   stakeTxID,
+        StakingAmount: stakeAmount,
+        SigningKey:    o.identity.SigningPublicKey,
+        I2PDest:       o.i2p.GetDestination(),
+        BlockHeight:   height,
+    }
+
+    return o.db.AddOracle(announcement)
+}
+
+func (o *OracleSystem) SelectOracles(marketID string, resolutionBlock uint64) []*OracleAnnouncement {
+    seed := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", marketID, resolutionBlock)))
+    rng := binary.BigEndian.Uint64(seed[:8])
+
+    oracles := o.db.GetOracles()
+    if len(oracles) == 0 {
+        return nil
+    }
+
+    selected := make([]*OracleAnnouncement, 0, 3)
+    for i := 0; i < 3 && i < len(oracles); i++ {
+        idx := int((rng + uint64(i)) % uint64(len(oracles)))
+        selected = append(selected, oracles[idx])
+    }
+    return selected
+}
+
+// ========== MAIN CLIENT ==========
+
+type PredictionClient struct {
+    db        *EncryptedDatabase
+    identity  *UserIdentity
+    monero    *MoneroClient
+    i2p       *I2PNetwork
+    dht       *KademliaDHT
+    oracleSys *OracleSystem
+    reader    *bufio.Reader
+    ctx       context.Context
+    cancel    context.CancelFunc
+    password  string
+}
+
+func NewPredictionClient(dbPath, password, recoveryMnemonic string) (*PredictionClient, error) {
+    db, err := NewEncryptedDatabase(dbPath, password)
+    if err != nil {
+        return nil, fmt.Errorf("failed to init database: %w", err)
+    }
+
+    identity, err := NewUserIdentity(dbPath, password, recoveryMnemonic)
+    if err != nil {
+        return nil, fmt.Errorf("failed to init identity: %w", err)
+    }
+
+    moneroUser := os.Getenv("XMR_RPC_USER")
+    moneroPass := os.Getenv("XMR_RPC_PASS")
+    if moneroUser == "" {
+        moneroUser = "default"
+        moneroPass = "changeme"
+        fmt.Println("\n⚠️ WARNING: Monero RPC using default credentials!")
+        fmt.Println("   Set XMR_RPC_USER and XMR_RPC_PASS environment variables")
+        fmt.Println("   And run monero-wallet-rpc with: --rpc-login user:pass")
+    }
+    
+    monero, err := NewMoneroClient(moneroUser, moneroPass)
+    if err != nil {
+        return nil, err
+    }
+
+    i2p, err := NewI2PNetwork(identity)
+    if err != nil {
+        return nil, err
+    }
+
+    dht := NewKademliaDHT(i2p)
+    if err := dht.Start(); err != nil {
+        return nil, fmt.Errorf("failed to start DHT: %w", err)
+    }
+
+    oracleSys := NewOracleSystem(db, monero, identity, i2p)
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    return &PredictionClient{
+        db:        db,
+        identity:  identity,
+        monero:    monero,
+        i2p:       i2p,
+        dht:       dht,
+        oracleSys: oracleSys,
+        reader:    bufio.NewReader(os.Stdin),
+        ctx:       ctx,
+        cancel:    cancel,
+        password:  password,
+    }, nil
+}
+
+func (c *PredictionClient) Run() {
+    c.printBanner()
+    c.printStakeSlashingDisclaimer()
+
+    for {
+        fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+        fmt.Println("│                       MAIN MENU                             │")
+        fmt.Println("├────────────────────────────────────────────────────────────┤")
+        fmt.Println("│  1. Post a Market                                           │")
+        fmt.Println("│  2. Browse Markets                                          │")
+        fmt.Println("│  3. Check My Bets                                           │")
+        fmt.Println("│  4. Resolve My Market (if maker)                            │")
+        fmt.Println("│  5. File Dispute (dishonest resolution)                     │")
+        fmt.Println("│  6. File Non-Resolution Complaint                           │")
+        fmt.Println("│  7. Announce as Oracle                                      │")
+        fmt.Println("│  8. Show My Identity                                        │")
+        fmt.Println("│  9. Export Backup                                           │")
+        fmt.Println("│ 10. Check Wallet Balance                                    │")
+        fmt.Println("│ 11. Add Peer (join the network)                             │")
+        fmt.Println("│ 12. Show Network Status                                     │")
+        fmt.Println("│ 13. Exit                                                    │")
+        fmt.Println("└────────────────────────────────────────────────────────────┘")
+        fmt.Print("\nChoice: ")
+
+        choice, _ := c.reader.ReadString('\n')
+        choice = strings.TrimSpace(choice)
+
+        switch choice {
+        case "1":
+            c.postMarket()
+        case "2":
+            c.browseMarkets()
+        case "3":
+            c.checkMyBets()
+        case "4":
+            c.resolveMarket()
+        case "5":
+            c.fileDispute()
+        case "6":
+            c.fileComplaint()
+        case "7":
+            c.announceOracle()
+        case "8":
+            c.showIdentity()
+        case "9":
+            c.exportBackup()
+        case "10":
+            c.checkBalance()
+        case "11":
+            c.addPeer()
+        case "12":
+            c.showNetworkStatus()
+        case "13":
+            fmt.Println("\nGoodbye!")
+            c.cancel()
+            return
+        }
+    }
+}
+
+func (c *PredictionClient) printBanner() {
+    fmt.Printf("\n╔════════════════════════════════════════════════════════════════╗\n")
+    fmt.Printf("║                    PREDICTION MARKET CLIENT                     ║\n")
+    fmt.Printf("╠════════════════════════════════════════════════════════════════╣\n")
+    fmt.Printf("║ Genesis: %s║\n", GenesisHash[:32])
+    fmt.Printf("║ Dev Fee: %d%% | Oracle Fee: %d%%                                  ║\n", DeveloperFeePercent, OracleFeePercent)
+    fmt.Printf("║ Min Bet: %.4f XMR | Bond: %.4f XMR                               ║\n", float64(MinBetSizePiconero)/1e12, float64(BondAmountPiconero)/1e12)
+    fmt.Printf("║ I2P Address: %s...                                          ║\n", c.i2p.GetBase32Address()[:25])
+    fmt.Printf("║ Node ID: %x...                                                  ║\n", c.dht.NodeID[:8])
+    fmt.Printf("╚════════════════════════════════════════════════════════════════╝\n")
+}
+
+func (c *PredictionClient) printStakeSlashingDisclaimer() {
+    fmt.Println("\n╔════════════════════════════════════════════════════════════════╗")
+    fmt.Println("║  DISCLAIMER: Stake slashing is NOT enforced by Monero.        ║")
+    fmt.Println("║  Oracle stakes cannot be slashed on-chain. Verify oracle      ║")
+    fmt.Println("║  honesty by cross-referencing multiple independent oracles.   ║")
+    fmt.Println("╚════════════════════════════════════════════════════════════════╝")
+}
+
+func (c *PredictionClient) addPeer() {
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    ADD PEER TO NETWORK                      │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+    fmt.Println()
+    fmt.Println("To join the prediction market network, enter an I2P address")
+    fmt.Println("of an existing peer.")
+    fmt.Println()
+    fmt.Println("Valid formats:")
+    fmt.Println("  - Base32 (52 chars): abc123...b32.i2p")
+    fmt.Println("  - Base32 encrypted (56+ chars): def456...b32.i2p")
+    fmt.Println("  - Hostname: example.i2p")
+    fmt.Println()
+    fmt.Println("Peers expire after 1 hour of no contact.")
+    fmt.Print("\nI2P Address: ")
+    peerAddr, _ := c.reader.ReadString('\n')
+    peerAddr = strings.TrimSpace(peerAddr)
+
+    if peerAddr == "" {
+        fmt.Println("No address entered.")
+        return
+    }
+
+    if !isValidI2PAddress(peerAddr) {
+        fmt.Println("❌ Invalid I2P address format.")
+        fmt.Println("   Must be a valid .i2p address or base32 string.")
+        return
+    }
+
+    fmt.Println("\nConnecting to peer...")
+
+    if err := c.dht.AddManualPeer(peerAddr); err != nil {
+        fmt.Printf("❌ Failed to connect: %v\n", err)
+        fmt.Println("\nMake sure:")
+        fmt.Println("  - The I2P address is correct")
+        fmt.Println("  - The peer is online")
+        fmt.Println("  - Your I2P router is running")
+        return
+    }
+
+    fmt.Println("✅ Peer added successfully!")
+    fmt.Println("The DHT will now discover other peers automatically.")
+
+    go func() {
+        _, err := c.dht.IterativeFindNode(c.dht.NodeID)
+        if err != nil {
+            fmt.Printf("\n⚠️ Peer discovery warning: %v\n", err)
+        } else {
+            fmt.Printf("\n🌐 Network discovered! Found %d peers.\n", c.dht.GetPeerCount())
+        }
+    }()
+}
+
+func (c *PredictionClient) showNetworkStatus() {
+    peerCount := c.dht.GetPeerCount()
+    
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    NETWORK STATUS                           │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+    fmt.Printf("\n  Node ID:     %x\n", c.dht.NodeID[:8])
+    fmt.Printf("  I2P Address: %s\n", c.i2p.GetBase32Address()[:40])
+    fmt.Printf("  Known Peers: %d\n", peerCount)
+    
+    if peerCount == 0 {
+        fmt.Println("\n⚠️ You are not connected to any peers!")
+        fmt.Println("   Use option 11 to add a peer and join the network.")
+    } else {
+        fmt.Println("\n  Peers expire after 1 hour of no contact.")
+        fmt.Println("  The DHT automatically discovers new peers.")
+        
+        peers := c.dht.GetPeers()
+        fmt.Println("\n  Sample peers:")
+        for i, p := range peers {
+            if i >= 5 {
+                break
+            }
+            fmt.Printf("    - %s... (last seen: %v ago)\n", 
+                p.I2PDest[:20], 
+                time.Since(p.LastSeen).Round(time.Second))
+        }
+        if len(peers) > 5 {
+            fmt.Printf("    ... and %d more\n", len(peers)-5)
+        }
+    }
+}
+
+func (c *PredictionClient) postMarket() {
+    fmt.Println("\n┌────────────────────────────────────────────────────────────┐")
+    fmt.Println("│                    CREATE NEW MARKET                        │")
+    fmt.Println("└────────────────────────────────────────────────────────────┘")
+
+    fmt.Print("Event name: ")
+    name, _ := c.reader.ReadString('\n')
+    name = strings.TrimSpace(name)
+    if name == "" {
+        fmt.Println("Event name required")
+        return
+    }
+
+    fmt.Print("Event description: ")
+    desc, _ := c.reader.ReadString('\n')
+    desc = strings.TrimSpace(desc)
+
+    fmt.Print("Resolution block height (Monero block #): ")
+    blockStr, _ := c.reader.ReadString('\n')
+    blockHeight, err := strconv.ParseUint(strings.TrimSpace(blockStr), 10, 64)
+    if err != nil {
+        fmt.Printf("Invalid block height: %v\n", err)
+        return
+    }
+
+    fmt.Print("Odds (format: numerator denominator, e.g., '2 1' for 2:1): ")
+    oddsStr, _ := c.reader.ReadString('\n')
+    var num, denom uint64
+    if _, err := fmt.Sscanf(strings.TrimSpace(oddsStr), "%d %d", &num, &denom); err != nil {
+        fmt.Printf("Invalid odds format: %v\n", err)
+        return
+    }
+    if denom == 0 {
+        denom = 1
+    }
+
+    fmt.Print("Max liability (XMR): ")
+    liabilityStr, _ := c.reader.ReadString('\n')
+    liabilityXMR, err := strconv.ParseFloat(strings.TrimSpace(liabilityStr), 64)
+    if err != nil {
+        fmt.Printf("Invalid liability: %v\n", err)
+        return
+    }
+    maxLiability := uint64(liabilityXMR * 1e12)
+
+    fmt.Printf("\nLocking bond of %.4f XMR...\n", float64(BondAmountPiconero)/1e12)
+    bondIdx, bondAddr, err := c.monero.GenerateSubaddress(0, "Market Bond")
+    if err != nil {
+        fmt.Printf("Failed to generate bond address: %v\n", err)
+        return
+    }
+
+    fmt.Printf("Send exactly %.4f XMR to:\n%s\n", float64(BondAmountPiconero)/1e12, bondAddr)
+    fmt.Print("Press ENTER after sending...")
+    c.reader.ReadString('\n')
+
+    var bondTxID string
+    fmt.Print("Waiting for confirmation")
+    for i := 0; i < 60; i++ {
+        txID, amount, confs, err := c.monero.CheckDeposit(bondIdx, BondAmountPiconero)
+        if err == nil && amount >= BondAmountPiconero && confs >= ConfirmationThresholdSmall {
+            bondTxID = txID
+            break
+        }
+        fmt.Print(".")
+        time.Sleep(2 * time.Second)
+    }
+    fmt.Println()
+
+    if bondTxID == "" {
+        fmt.Println("Bond not confirmed after 120 seconds")
+        return
+    }
+    fmt.Println("Bond confirmed!")
+
+    currentHeight, err := c.monero.GetCurrentBlockHeight()
+    if err != nil {
+        currentHeight = 0
+    }
+
+    market := &Market{
+        EventName:        name,
+        EventDescription: desc,
+        ResolutionBlock:  blockHeight,
+        OddsNumerator:    num,
+        OddsDenominator:  denom,
+        MaxLiability:     maxLiability,
+        UsedLiability:    0,
+        BondTxID:         bondTxID,
+        MakerSigningKey:  c.identity.SigningPublicKey,
+        MakerI2PDest:     c.i2p.GetDestination(),
+        Nonce:            uint64(time.Now().UnixNano()),
+        CreationBlock:    currentHeight,
+        GenesisHash:      GenesisHash,
+    }
+
+    serialized := serializeMarket(market)
+    market.Signature = ed25519.Sign(c.identity.SigningPrivateKey, serialized)
+    market.ID = sha256Hash(serialized)
+
+    if err := c.db.AddMarket(market); err != nil {
+        fmt.Printf("Failed to save market: %v\n", err)
+        return
+    }
+
+    marketData, _ := json.Marshal(market)
+    if err := c.dht.StoreValue("market:"+market.ID, marketData); err != nil {
+        fmt.Printf("Warning: Failed to store market in DHT: %v\n", err)
+   
