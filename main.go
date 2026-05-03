@@ -1258,4 +1258,430 @@ func (d *KademliaDHT) GetValuesWithPrefix(prefix string) (map[string][]byte, err
 func (d *KademliaDHT) handleDHTMessage(conn net.Conn) {
     defer conn.Close()
     
-    remoteAddr := conn.RemoteAddr().S
+    remoteAddr := conn.RemoteAddr().String()
+    if !d.rateLimiter.Allow(remoteAddr) {
+        return
+    }
+
+    var msg struct {
+        Type       string          `json:"type"`
+        SenderID   []byte          `json:"sender_id"`
+        SenderDest string          `json:"sender_dest"`
+        Target     []byte          `json:"target,omitempty"`
+        Key        string          `json:"key,omitempty"`
+        Value      []byte          `json:"value,omitempty"`
+        Nodes      []*PeerNode     `json:"nodes,omitempty"`
+    }
+
+    decoder := json.NewDecoder(conn)
+    if err := decoder.Decode(&msg); err != nil {
+        return
+    }
+
+    if msg.SenderID != nil && isValidI2PAddress(msg.SenderDest) {
+        d.AddPeer(msg.SenderID, msg.SenderDest)
+    }
+
+    switch msg.Type {
+    case "PING":
+        response := struct {
+            Type        string `json:"type"`
+            ResponderID []byte `json:"responder_id"`
+        }{
+            Type:        "PONG",
+            ResponderID: d.NodeID,
+        }
+        json.NewEncoder(conn).Encode(response)
+
+    case "FIND_NODE":
+        nodes := d.FindClosest(msg.Target, KademliaBucketSize)
+        response := struct {
+            Type  string      `json:"type"`
+            Nodes []*PeerNode `json:"nodes"`
+        }{
+            Type:  "FIND_NODE_RESPONSE",
+            Nodes: nodes,
+        }
+        json.NewEncoder(conn).Encode(response)
+
+    case "FIND_VALUE":
+        if data, ok := d.Session.GetValue(msg.Key); ok {
+            response := struct {
+                Type  string `json:"type"`
+                Value []byte `json:"value"`
+            }{
+                Type:  "FIND_VALUE_RESPONSE",
+                Value: data,
+            }
+            json.NewEncoder(conn).Encode(response)
+        } else {
+            nodes := d.FindClosest(sha256HashToID(msg.Key), KademliaBucketSize)
+            response := struct {
+                Type  string      `json:"type"`
+                Nodes []*PeerNode `json:"nodes"`
+            }{
+                Type:  "FIND_NODE_RESPONSE",
+                Nodes: nodes,
+            }
+            json.NewEncoder(conn).Encode(response)
+        }
+
+    case "STORE":
+        d.Session.StoreValue(msg.Key, msg.Value)
+    }
+}
+
+func (d *KademliaDHT) refreshLoop() {
+    ticker := time.NewTicker(30 * time.Minute)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-d.ctx.Done():
+            return
+        case <-ticker.C:
+            bucketIdx := rand.Intn(NodeIDBits)
+            if d.Session.RoutingTable[bucketIdx].Len() > 0 {
+                nodes := d.Session.RoutingTable[bucketIdx].GetClosest(1)
+                if len(nodes) > 0 {
+                    d.IterativeFindNode(nodes[0].ID)
+                }
+            }
+        }
+    }
+}
+
+func (d *KademliaDHT) cleanupLoop() {
+    ticker := time.NewTicker(PeerCleanupInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-d.ctx.Done():
+            return
+        case <-ticker.C:
+            removed := 0
+            for i := 0; i < NodeIDBits; i++ {
+                removed += d.Session.RoutingTable[i].RemoveStalePeers()
+            }
+            if removed > 0 {
+                fmt.Printf("Cleaned up %d stale peers\n", removed)
+            }
+        }
+    }
+}
+
+func (d *KademliaDHT) GetPeerCount() int {
+    count := 0
+    for i := 0; i < NodeIDBits; i++ {
+        count += d.Session.RoutingTable[i].Len()
+    }
+    return count
+}
+
+func (d *KademliaDHT) Stop() {
+    d.cancel()
+}
+
+func sha256HashToID(key string) []byte {
+    hash := sha256.Sum256([]byte(key))
+    return hash[:20]
+}
+
+// ========== UTILITY FUNCTIONS ==========
+
+// FIXED: Proper SSH key parsing instead of assuming last 32 bytes
+func mustParseSSHKey(b64key string) []byte {
+    parts := strings.Split(b64key, " ")
+    var decoded []byte
+    var err error
+    
+    if len(parts) >= 2 {
+        // Standard SSH authorized_keys format: "ssh-ed25519 AAAA..."
+        decoded, err = base64.StdEncoding.DecodeString(parts[1])
+    } else {
+        // Raw base64
+        decoded, err = base64.StdEncoding.DecodeString(b64key)
+    }
+    
+    if err != nil {
+        panic(fmt.Sprintf("Failed to decode developer key: %v", err))
+    }
+    
+    // Ed25519 public keys are 32 bytes
+    // SSH format has a length prefix and algorithm name before the key
+    if len(decoded) >= 32 {
+        return decoded[len(decoded)-32:]
+    }
+    if len(decoded) == 32 {
+        return decoded
+    }
+    panic("Developer key too short")
+}
+
+func sha256Hash(data []byte) string {
+    hash := sha256.Sum256(data)
+    return hex.EncodeToString(hash[:])
+}
+
+// FIXED: Use %x for []byte fields instead of %s
+func serializeMarket(m *Market) []byte {
+    return []byte(fmt.Sprintf("%s|%s|%s|%d|%d|%d|%d|%s|%x|%s|%d|%d|%s",
+        m.ID, m.EventName, m.EventDescription, m.ResolutionBlock,
+        m.OddsNumerator, m.OddsDenominator, m.MaxLiability, m.BondTxID,
+        m.MakerSigningKey, m.MakerI2PDest, m.Nonce, m.CreationBlock, m.GenesisHash))
+}
+
+// FIXED: Use %x for []byte fields instead of %s
+func serializeBetOffer(b *BetOffer) []byte {
+    return []byte(fmt.Sprintf("%s|%s|%t|%d|%s|%s|%d|%x|%s|%d|%d|%s",
+        b.ID, b.MarketID, b.ChosenOutcome, b.WagerAmount, b.PayoutSubaddress,
+        b.DepositTxID, b.DepositSubaddressIndex, b.BettorSigningKey, b.BettorI2PDest,
+        b.Nonce, b.CreationBlock, b.GenesisHash))
+}
+
+func currentMoneroBlockHeight() (uint64, error) {
+    reqBody := []byte(`{"jsonrpc":"2.0","id":"0","method":"get_block_count","params":[]}`)
+    resp, err := http.Post("http://127.0.0.1:18081/json_rpc", "application/json", bytes.NewReader(reqBody))
+    if err != nil {
+        return 0, fmt.Errorf("failed to connect to monerod: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var rpcResp struct {
+        Result struct {
+            Count uint64 `json:"count"`
+        } `json:"result"`
+        Error struct {
+            Code    int    `json:"code"`
+            Message string `json:"message"`
+        } `json:"error"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+        return 0, fmt.Errorf("failed to decode monerod response: %w", err)
+    }
+    if rpcResp.Error.Code != 0 {
+        return 0, fmt.Errorf("monerod RPC error: %s", rpcResp.Error.Message)
+    }
+    return rpcResp.Result.Count, nil
+}
+
+// ========== MONERO CLIENT ==========
+
+type MoneroClient struct {
+    client   *walletrpc.Client
+    ctx      context.Context
+    username string
+    password string
+    seed     string
+}
+
+// FIXED: Added HTTP client timeout to prevent indefinite hangs
+func NewMoneroClient(username, password, seed string) (*MoneroClient, error) {
+    ctx := context.Background()
+
+    httpClient := &http.Client{
+        Transport: httpdigest.New(username, password),
+        Timeout:   MoneroRPCTimeout,
+    }
+
+    client := walletrpc.New(walletrpc.Config{
+        Address: "http://127.0.0.1:18082/json_rpc",
+        Client:  httpClient,
+    })
+
+    if seed != "" {
+        fmt.Println("Restoring wallet from seed...")
+    }
+
+    _, err := client.GetBalance(ctx, &walletrpc.GetBalanceRequest{
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("cannot connect to monero-wallet-rpc: %w\n"+
+            "Please run: monero-wallet-rpc --wallet-file wallet.bin --rpc-bind-port 18082 --rpc-login %s:***\n", err, username)
+    }
+
+    return &MoneroClient{
+        client:   client,
+        ctx:      ctx,
+        username: username,
+        password: password,
+        seed:     seed,
+    }, nil
+}
+
+// FIXED: All RPC calls now use context.WithTimeout
+func (m *MoneroClient) GenerateSubaddress(accountIndex uint32, label string) (uint32, string, error) {
+    ctx, cancel := context.WithTimeout(m.ctx, MoneroRPCTimeout)
+    defer cancel()
+    
+    resp, err := m.client.CreateAddress(ctx, &walletrpc.CreateAddressRequest{
+        AccountIndex: accountIndex,
+        Label:        label,
+    })
+    if err != nil {
+        return 0, "", fmt.Errorf("failed to create address: %w", err)
+    }
+    return resp.AddressIndex, resp.Address, nil
+}
+
+func (m *MoneroClient) CheckDeposit(subaddressIndex uint32, expectedAmount uint64) (string, uint64, int, error) {
+    ctx, cancel := context.WithTimeout(m.ctx, MoneroRPCTimeout)
+    defer cancel()
+    
+    transfers, err := m.client.GetTransfers(ctx, &walletrpc.GetTransfersRequest{
+        In:           true,
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return "", 0, 0, fmt.Errorf("failed to get transfers: %w", err)
+    }
+
+    for _, tx := range transfers.In {
+        if tx.SubaddrIndex.Minor == subaddressIndex {
+            daemonHeight, err := currentMoneroBlockHeight()
+            if err != nil {
+                return tx.TxID, tx.Amount, 0, nil
+            }
+            confirmations := int(daemonHeight - tx.Height)
+            return tx.TxID, tx.Amount, confirmations, nil
+        }
+    }
+    return "", 0, 0, nil
+}
+
+func (m *MoneroClient) SendPayout(address string, amount uint64) (string, error) {
+    ctx, cancel := context.WithTimeout(m.ctx, MoneroRPCTimeout)
+    defer cancel()
+    
+    resp, err := m.client.Transfer(ctx, &walletrpc.TransferRequest{
+        Destinations: []walletrpc.Destination{
+            {Address: address, Amount: amount},
+        },
+        AccountIndex: 0,
+        Priority:     walletrpc.PriorityUnimportant,
+    })
+    if err != nil {
+        return "", fmt.Errorf("failed to send payout: %w", err)
+    }
+    return resp.TxHash, nil
+}
+
+func (m *MoneroClient) SendDeveloperFee(amount uint64) (string, error) {
+    if amount == 0 {
+        return "", nil
+    }
+    return m.SendPayout(DeveloperAddress, amount)
+}
+
+func (m *MoneroClient) GetBalance() (uint64, uint64, error) {
+    ctx, cancel := context.WithTimeout(m.ctx, MoneroRPCTimeout)
+    defer cancel()
+    
+    resp, err := m.client.GetBalance(ctx, &walletrpc.GetBalanceRequest{
+        AccountIndex: 0,
+    })
+    if err != nil {
+        return 0, 0, err
+    }
+    return resp.Balance, resp.UnlockedBalance, nil
+}
+
+// ========== I2P NETWORK ==========
+
+type I2PNetwork struct {
+    sam      *sam3.SAM
+    session  *sam3.StreamSession
+    identity *PersistedIdentity
+    ctx      context.Context
+    cancel   context.CancelFunc
+    mu       sync.RWMutex
+}
+
+func NewI2PNetwork(identity *PersistedIdentity) (*I2PNetwork, error) {
+    sam, err := sam3.NewSAM("127.0.0.1:7656")
+    if err != nil {
+        return nil, fmt.Errorf("failed to connect to I2P SAM bridge: %w\n"+
+            "Please ensure I2P router is running (i2prouter start or i2pd --sam.enabled=true)", err)
+    }
+
+    var keys *sam3.Keys
+    if identity.I2PPrivateKey != nil && identity.I2PPublicKey != nil {
+        keys = &sam3.Keys{
+            Pub:  identity.I2PPublicKey,
+            Priv: identity.I2PPrivateKey,
+        }
+    } else {
+        keys, err = sam.NewKeys()
+        if err != nil {
+            return nil, fmt.Errorf("failed to generate I2P keys: %w", err)
+        }
+        identity.I2PPublicKey = keys.Pub
+        identity.I2PPrivateKey = keys.Priv
+    }
+
+    session, err := sam.NewStreamSession("prediction-market", keys, sam3.Options{
+        "inbound.length":   "3",
+        "outbound.length":  "3",
+        "inbound.quantity": "3",
+        "outbound.quantity": "3",
+    })
+    if err != nil {
+        return nil, fmt.Errorf("failed to create I2P session: %w", err)
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    return &I2PNetwork{
+        sam:      sam,
+        session:  session,
+        identity: identity,
+        ctx:      ctx,
+        cancel:   cancel,
+    }, nil
+}
+
+func (i *I2PNetwork) GetDestination() string {
+    return i.session.Dest().String()
+}
+
+func (i *I2PNetwork) GetBase32Address() string {
+    return i.session.Dest().Base32()
+}
+
+func (i *I2PNetwork) DialPeer(dest string) (net.Conn, error) {
+    if !isValidI2PAddress(dest) {
+        return nil, fmt.Errorf("invalid I2P address")
+    }
+    return i.session.Dial(dest)
+}
+
+func (i *I2PNetwork) StartListener(handler func(conn net.Conn)) error {
+    listener, err := i.session.Listen()
+    if err != nil {
+        return fmt.Errorf("failed to create listener: %w", err)
+    }
+
+    go func() {
+        for {
+            select {
+            case <-i.ctx.Done():
+                return
+            default:
+                conn, err := listener.Accept()
+                if err != nil {
+                    continue
+                }
+                go handler(conn)
+            }
+        }
+    }()
+
+    return nil
+}
+
+func (i *I2PNetwork) Stop() {
+    i.cancel()
+}
+```
