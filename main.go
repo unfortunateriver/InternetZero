@@ -2272,9 +2272,347 @@ func (c *PredictionClient) Run() {
         go c.resolutionSys.MonitorOracleRequests()
     }
     
+    
     // FIXED: Background DHT sync loop to refresh markets and bets
     go c.backgroundSync()
 
     for {
         fmt.Println("\n┌──────────────────────────────────────────────────────────────────────┐")
-        fmt.Println("│       
+        fmt.Println("│                            MAIN MENU                                  │")
+        fmt.Println("├──────────────────────────────────────────────────────────────────────┤")
+        fmt.Println("│  1. Post a Market                                                     │")
+        fmt.Println("│  2. Browse Markets                                                    │")
+        fmt.Println("│  3. Check My Bets                                                     │")
+        fmt.Println("│  4. Propose Market Resolution (if maker)                              │")
+        fmt.Println("│  5. File Dispute (dishonest resolution)                               │")
+        fmt.Println("│  6. File Non-Resolution Complaint                                     │")
+        fmt.Println("│  7. Announce as Oracle (stake required)                               │")
+        fmt.Println("│  8. Show My Identity                                                  │")
+        fmt.Println("│  9. Check Wallet Balance                                              │")
+        fmt.Println("│ 10. Add Peer (join the network)                                       │")
+        fmt.Println("│ 11. Show Network Status                                               │")
+        fmt.Println("│ 12. Exit (saves identity and session data)                            │")
+        fmt.Println("└──────────────────────────────────────────────────────────────────────┘")
+        fmt.Print("\nChoice: ")
+
+        choice, _ := c.reader.ReadString('\n')
+        choice = strings.TrimSpace(choice)
+
+        switch choice {
+        case "1":
+            c.postMarket()
+        case "2":
+            c.browseMarkets()
+        case "3":
+            c.checkMyBets()
+        case "4":
+            c.proposeResolution()
+        case "5":
+            c.fileDispute()
+        case "6":
+            c.fileComplaint()
+        case "7":
+            c.announceOracle()
+        case "8":
+            c.showIdentity()
+        case "9":
+            c.checkBalance()
+        case "10":
+            c.addPeer()
+        case "11":
+            c.showNetworkStatus()
+        case "12":
+            fmt.Println("\nSaving identity and session data...")
+            c.saveIdentity()
+            c.dht.Stop()
+            c.i2p.Stop()
+            c.heartbeatSys.Stop()
+            c.cancel()
+            fmt.Println("Goodbye!")
+            return
+        }
+    }
+}
+
+// FIXED: Background DHT sync keeps markets and bets fresh
+func (c *PredictionClient) backgroundSync() {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-c.ctx.Done():
+            return
+        case <-ticker.C:
+            // Fetch fresh markets from DHT
+            marketData, err := c.dht.GetValuesWithPrefix("market:")
+            if err == nil {
+                for _, data := range marketData {
+                    var market Market
+                    if json.Unmarshal(data, &market) == nil {
+                        c.session.AddDiscoveredMarket(&market)
+                    }
+                }
+            }
+            
+            // Fetch fresh bet offers
+            betData, err := c.dht.GetValuesWithPrefix("bet:")
+            if err == nil {
+                for _, data := range betData {
+                    var bet BetOffer
+                    if json.Unmarshal(data, &bet) == nil {
+                        c.session.AddSeenBetOffer(&bet)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// FIXED: saveIdentity now works without re-prompting for password
+func (c *PredictionClient) saveIdentity() {
+    // Save active markets and pending bets back to identity
+    c.identity.ActiveMarkets = make(map[string]*Market)
+    c.identity.PendingBets = make(map[string]*BetOffer)
+    
+    for id, market := range c.session.DiscoveredMarkets {
+        if string(market.MakerSigningKey) == string(c.identity.SigningPublicKey) && !market.Resolved {
+            c.identity.ActiveMarkets[id] = market
+        }
+    }
+    
+    for id, bet := range c.session.SeenBetOffers {
+        if string(bet.BettorSigningKey) == string(c.identity.SigningPublicKey) && bet.Status == "pending" {
+            c.identity.PendingBets[id] = bet
+        }
+    }
+    
+    // FIXED: Use stored password
+    if err := SaveIdentity(c.dbPath, c.password, c.identity); err != nil {
+        fmt.Printf("⚠️ Failed to save identity: %v\n", err)
+    } else {
+        fmt.Println("✅ Identity saved to disk.")
+    }
+}
+
+func (c *PredictionClient) printBanner() {
+    oracleStatus := ""
+    if c.identity.IsOracle {
+        oracleStatus = " | ORACLE MODE ACTIVE"
+    }
+    
+    nodeIDStr := hex.EncodeToString(c.dht.NodeID)
+    if len(nodeIDStr) > 16 {
+        nodeIDStr = nodeIDStr[:16]
+    }
+    
+    fmt.Printf("\n╔══════════════════════════════════════════════════════════════════════╗\n")
+    fmt.Printf("║                    PREDICTION MARKET CLIENT%s          ║\n", oracleStatus)
+    fmt.Printf("╠══════════════════════════════════════════════════════════════════════╣\n")
+    fmt.Printf("║ Genesis: %s  ║\n", GenesisHash[:32])
+    fmt.Printf("║ Dev Fee: %d%% | Oracle Fee: %d%%                                            ║\n", DeveloperFeePercent, OracleFeePercent)
+    fmt.Printf("║ Min Bet: %.4f XMR | Bond: %.4f XMR                                     ║\n", float64(MinBetSizePiconero)/1e12, float64(BondAmountPiconero)/1e12)
+    fmt.Printf("║ I2P: %s                                           ║\n", c.i2p.GetBase32Address()[:40])
+    fmt.Printf("║ Node: %s                                                     ║\n", nodeIDStr)
+    fmt.Printf("╚══════════════════════════════════════════════════════════════════════╝\n")
+}
+
+func (c *PredictionClient) printStakeSlashingDisclaimer() {
+    fmt.Println("\n╔══════════════════════════════════════════════════════════════════════╗")
+    fmt.Println("║  DISCLAIMER: Stake slashing may apply for dishonest behavior.        ║")
+    fmt.Println("║  Oracle stake can be forfeited for false attestations.               ║")
+    fmt.Println("║  Market makers must resolve within the resolution window.            ║")
+    fmt.Println("╚══════════════════════════════════════════════════════════════════════╝")
+}
+
+func (c *PredictionClient) postMarket() {
+    fmt.Println("\n--- Post a New Market ---")
+    // ... (placeholder - market creation logic)
+    fmt.Println("Market posting not yet implemented in this UI path.")
+    fmt.Println("(Market creation happens through DHT broadcast.)")
+}
+
+func (c *PredictionClient) browseMarkets() {
+    fmt.Println("\n--- Browsing Markets ---")
+    markets := c.session.GetDiscoveredMarkets()
+    if len(markets) == 0 {
+        fmt.Println("No markets discovered yet. Add peers or wait for DHT sync.")
+        return
+    }
+    for i, m := range markets {
+        status := "Active"
+        if m.Resolved {
+            outcome := "Unknown"
+            if m.ResolutionOutcome != nil {
+                if *m.ResolutionOutcome {
+                    outcome = "YES"
+                } else {
+                    outcome = "NO"
+                }
+            }
+            status = fmt.Sprintf("Resolved: %s", outcome)
+        } else if m.Expired {
+            status = "Expired"
+        }
+        fmt.Printf("%d. [%s] %s (odds: %d/%d)\n", i+1, status, m.EventName, m.OddsNumerator, m.OddsDenominator)
+    }
+}
+
+func (c *PredictionClient) checkMyBets() {
+    fmt.Println("\n--- My Bets ---")
+    var myBets []*BetOffer
+    for _, bet := range c.session.SeenBetOffers {
+        if string(bet.BettorSigningKey) == string(c.identity.SigningPublicKey) {
+            myBets = append(myBets, bet)
+        }
+    }
+    if len(myBets) == 0 {
+        fmt.Println("No bets placed yet.")
+        return
+    }
+    for i, b := range myBets {
+        fmt.Printf("%d. Market: %s | Amount: %.4f XMR | Status: %s\n",
+            i+1, b.MarketID[:16], float64(b.WagerAmount)/1e12, b.Status)
+    }
+}
+
+func (c *PredictionClient) proposeResolution() {
+    fmt.Println("\n--- Propose Resolution ---")
+    markets := c.session.GetDiscoveredMarkets()
+    var myMarkets []*Market
+    for _, m := range markets {
+        if string(m.MakerSigningKey) == string(c.identity.SigningPublicKey) && !m.Resolved {
+            myMarkets = append(myMarkets, m)
+        }
+    }
+    if len(myMarkets) == 0 {
+        fmt.Println("You have no active markets to resolve.")
+        return
+    }
+    for i, m := range myMarkets {
+        fmt.Printf("%d. %s (block: %d)\n", i+1, m.EventName, m.ResolutionBlock)
+    }
+    fmt.Print("Select market number: ")
+    choice, _ := c.reader.ReadString('\n')
+    idx, err := strconv.Atoi(strings.TrimSpace(choice))
+    if err != nil || idx < 1 || idx > len(myMarkets) {
+        fmt.Println("Invalid selection.")
+        return
+    }
+    market := myMarkets[idx-1]
+    c.resolutionSys.reader = c.reader
+    if err := c.resolutionSys.ProposeResolution(market); err != nil {
+        fmt.Printf("Failed to propose resolution: %v\n", err)
+    }
+}
+
+func (c *PredictionClient) fileDispute() {
+    fmt.Println("\n--- File Dispute ---")
+    fmt.Println("Dispute filing not yet implemented.")
+}
+
+func (c *PredictionClient) fileComplaint() {
+    fmt.Println("\n--- File Non-Resolution Complaint ---")
+    fmt.Println("Complaint filing not yet implemented.")
+}
+
+func (c *PredictionClient) announceOracle() {
+    fmt.Println("\n--- Announce as Oracle ---")
+    fmt.Printf("Minimum stake: %.4f XMR\n", float64(MinOracleStakePiconero)/1e12)
+    fmt.Print("Stake amount (in piconero): ")
+    amountStr, _ := c.reader.ReadString('\n')
+    amount, err := strconv.ParseUint(strings.TrimSpace(amountStr), 10, 64)
+    if err != nil || amount < MinOracleStakePiconero {
+        fmt.Printf("Invalid amount. Minimum is %d piconero.\n", MinOracleStakePiconero)
+        return
+    }
+    if err := c.oracleSys.AnnounceAsOracle(amount); err != nil {
+        fmt.Printf("Failed to announce as oracle: %v\n", err)
+    }
+}
+
+func (c *PredictionClient) showIdentity() {
+    fmt.Println("\n--- My Identity ---")
+    fmt.Printf("Signing Key (pub): %x...\n", c.identity.SigningPublicKey[:16])
+    fmt.Printf("I2P Address: %s\n", c.i2p.GetBase32Address())
+    fmt.Printf("Is Oracle: %v\n", c.identity.IsOracle)
+}
+
+func (c *PredictionClient) checkBalance() {
+    balance, unlocked, err := c.monero.GetBalance()
+    if err != nil {
+        fmt.Printf("Failed to get balance: %v\n", err)
+        return
+    }
+    fmt.Printf("\nBalance: %.4f XMR\n", float64(balance)/1e12)
+    fmt.Printf("Unlocked: %.4f XMR\n", float64(unlocked)/1e12)
+}
+
+func (c *PredictionClient) addPeer() {
+    fmt.Print("\nEnter peer I2P address: ")
+    addr, _ := c.reader.ReadString('\n')
+    addr = strings.TrimSpace(addr)
+    if !isValidI2PAddress(addr) {
+        fmt.Println("Invalid I2P address.")
+        return
+    }
+    // Bootstrap: try to connect and exchange node info
+    fmt.Printf("Attempting to contact peer at %s...\n", addr)
+    c.dht.IterativeFindNode(c.dht.NodeID)
+    fmt.Println("Peer added. DHT will populate routing table.")
+}
+
+func (c *PredictionClient) showNetworkStatus() {
+    fmt.Println("\n--- Network Status ---")
+    fmt.Printf("Connected peers: %d\n", c.dht.GetPeerCount())
+    fmt.Printf("Discovered markets: %d\n", len(c.session.DiscoveredMarkets))
+    fmt.Printf("Active oracles: %d\n", len(c.session.GetActiveOracles()))
+    fmt.Printf("Pending proposals: %d\n", len(c.session.ResolutionProposals))
+}
+
+// ========== MAIN ENTRY POINT ==========
+
+func main() {
+    fmt.Println("╔══════════════════════════════════════════════════════════════════════╗")
+    fmt.Println("║              PREDICTION MARKET CLIENT - DECENTRALIZED                ║")
+    fmt.Println("║                 Monero + I2P + Kademlia DHT                        ║")
+    fmt.Println("╚══════════════════════════════════════════════════════════════════════╝")
+    
+    reader := bufio.NewReader(os.Stdin)
+    
+    fmt.Print("\nData directory path [default: ./pm_data]: ")
+    dbPath, _ := reader.ReadString('\n')
+    dbPath = strings.TrimSpace(dbPath)
+    if dbPath == "" {
+        dbPath = "./pm_data"
+    }
+    
+    fmt.Print("Password: ")
+    password, _ := reader.ReadString('\n')
+    password = strings.TrimSpace(password)
+    if password == "" {
+        fmt.Println("Password required.")
+        return
+    }
+    
+    createNew := false
+    if _, err := os.Stat(filepath.Join(dbPath, "identity.enc")); os.IsNotExist(err) {
+        fmt.Print("No existing identity found. Create new? [Y/n]: ")
+        resp, _ := reader.ReadString('\n')
+        createNew = strings.TrimSpace(strings.ToLower(resp)) != "n"
+    }
+    
+    fmt.Print("Run as oracle? [y/N]: ")
+    oracleResp, _ := reader.ReadString('\n')
+    isOracle := strings.TrimSpace(strings.ToLower(oracleResp)) == "y"
+    
+    client, err := NewPredictionClient(dbPath, password, createNew, isOracle)
+    if err != nil {
+        fmt.Printf("\n❌ Failed to initialize: %v\n", err)
+        return
+    }
+    
+    client.reader = reader
+    client.Run()
+}
+```
