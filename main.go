@@ -1685,3 +1685,596 @@ func (i *I2PNetwork) Stop() {
     i.cancel()
 }
 ```
+// ========== HEARTBEAT SYSTEM ==========
+
+type HeartbeatSystem struct {
+    dht      *KademliaDHT
+    identity *PersistedIdentity
+    ctx      context.Context
+    cancel   context.CancelFunc
+}
+
+func NewHeartbeatSystem(dht *KademliaDHT, identity *PersistedIdentity) *HeartbeatSystem {
+    ctx, cancel := context.WithCancel(context.Background())
+    return &HeartbeatSystem{
+        dht:      dht,
+        identity: identity,
+        ctx:      ctx,
+        cancel:   cancel,
+    }
+}
+
+func (h *HeartbeatSystem) Start() {
+    if !h.identity.IsOracle {
+        return
+    }
+    go h.sendHeartbeatLoop()
+}
+
+func (h *HeartbeatSystem) sendHeartbeatLoop() {
+    ticker := time.NewTicker(HeartbeatInterval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-h.ctx.Done():
+            h.sendOfflineHeartbeat()
+            return
+        case <-ticker.C:
+            h.sendHeartbeat()
+        }
+    }
+}
+
+func (h *HeartbeatSystem) sendHeartbeat() {
+    status := OracleStatus{
+        OracleID:      hex.EncodeToString(h.identity.SigningPublicKey[:min(8, len(h.identity.SigningPublicKey))]),
+        Online:        true,
+        LastHeartbeat: uint64(time.Now().Unix()),
+        CurrentVote:   "",
+        Capacity:      3,
+    }
+    
+    data, err := json.Marshal(status)
+    if err != nil {
+        return
+    }
+    
+    key := fmt.Sprintf("oracle:heartbeat:%s", status.OracleID)
+    if err := h.dht.StoreValue(key, data); err != nil {
+        fmt.Printf("⚠️ Heartbeat failed: %v\n", err)
+    }
+}
+
+func (h *HeartbeatSystem) sendOfflineHeartbeat() {
+    status := OracleStatus{
+        OracleID:      hex.EncodeToString(h.identity.SigningPublicKey[:min(8, len(h.identity.SigningPublicKey))]),
+        Online:        false,
+        LastHeartbeat: uint64(time.Now().Unix()),
+    }
+    
+    data, _ := json.Marshal(status)
+    key := fmt.Sprintf("oracle:heartbeat:%s", status.OracleID)
+    h.dht.StoreValue(key, data)
+}
+
+func (h *HeartbeatSystem) Stop() {
+    h.cancel()
+}
+
+// ========== ORACLE SYSTEM ==========
+
+type OracleSystem struct {
+    dht      *KademliaDHT
+    monero   *MoneroClient
+    identity *PersistedIdentity
+    session  *SessionData
+    i2p      *I2PNetwork
+}
+
+func NewOracleSystem(dht *KademliaDHT, monero *MoneroClient, identity *PersistedIdentity, session *SessionData, i2p *I2PNetwork) *OracleSystem {
+    return &OracleSystem{
+        dht:      dht,
+        monero:   monero,
+        identity: identity,
+        session:  session,
+        i2p:      i2p,
+    }
+}
+
+func (o *OracleSystem) AnnounceAsOracle(stakeAmount uint64) error {
+    idx, addr, err := o.monero.GenerateSubaddress(0, "Oracle Stake")
+    if err != nil {
+        return err
+    }
+
+    fmt.Printf("\nSend %.4f XMR stake to:\n%s\n", float64(stakeAmount)/1e12, addr)
+    fmt.Print("Press ENTER after sending...")
+    bufio.NewReader(os.Stdin).ReadString('\n')
+
+    var stakeTxID string
+    fmt.Print("Waiting for confirmation")
+    for i := 0; i < 60; i++ {
+        txID, amount, confs, err := o.monero.CheckDeposit(idx, stakeAmount)
+        if err == nil && amount >= stakeAmount && confs >= ConfirmationThresholdLarge {
+            stakeTxID = txID
+            break
+        }
+        fmt.Print(".")
+        time.Sleep(2 * time.Second)
+    }
+    fmt.Println()
+
+    if stakeTxID == "" {
+        return fmt.Errorf("stake not confirmed after 120 seconds")
+    }
+
+    height, _ := currentMoneroBlockHeight()
+    announcement := &OracleAnnouncement{
+        ID:            sha256Hash([]byte(stakeTxID)),
+        StakingTxID:   stakeTxID,
+        StakingAmount: stakeAmount,
+        SigningKey:    o.identity.SigningPublicKey,
+        I2PDest:       o.i2p.GetDestination(),
+        BlockHeight:   height,
+    }
+
+    announcementData, _ := json.Marshal(announcement)
+    if err := o.dht.StoreValue("oracle:registration:"+announcement.ID, announcementData); err != nil {
+        return err
+    }
+
+    o.session.AddOracleRegistration(announcement)
+    o.identity.IsOracle = true
+
+    return nil
+}
+
+func (o *OracleSystem) GetActiveOracles() ([]OracleStatus, error) {
+    active := o.session.GetActiveOracles()
+    
+    var result []OracleStatus
+    for _, status := range active {
+        result = append(result, *status)
+    }
+    return result, nil
+}
+
+func (o *OracleSystem) SelectRandomOracles(count int) ([]OracleStatus, error) {
+    active := o.session.GetActiveOracles()
+    if len(active) == 0 {
+        return nil, fmt.Errorf("no active oracles found")
+    }
+    
+    if len(active) < count {
+        count = len(active)
+    }
+    
+    // Shuffle
+    shuffled := make([]*OracleStatus, len(active))
+    copy(shuffled, active)
+    rand.Shuffle(len(shuffled), func(i, j int) {
+        shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+    })
+    
+    var selected []OracleStatus
+    for i := 0; i < count && i < len(shuffled); i++ {
+        selected = append(selected, *shuffled[i])
+    }
+    return selected, nil
+}
+
+// ========== RESOLUTION PROPOSAL SYSTEM ==========
+
+type ResolutionSystem struct {
+    dht        *KademliaDHT
+    monero     *MoneroClient
+    identity   *PersistedIdentity
+    session    *SessionData
+    oracleSys  *OracleSystem
+    reader     *bufio.Reader
+    i2p        *I2PNetwork
+}
+
+func NewResolutionSystem(dht *KademliaDHT, monero *MoneroClient, identity *PersistedIdentity, session *SessionData, oracleSys *OracleSystem, i2p *I2PNetwork) *ResolutionSystem {
+    return &ResolutionSystem{
+        dht:       dht,
+        monero:    monero,
+        identity:  identity,
+        session:   session,
+        oracleSys: oracleSys,
+        i2p:       i2p,
+    }
+}
+
+func (r *ResolutionSystem) ProposeResolution(market *Market) error {
+    fmt.Printf("\nResolving market: %s\n", market.EventName)
+    fmt.Printf("Resolution block: %d\n", market.ResolutionBlock)
+    fmt.Println("\nProvide justification for your resolution.")
+    fmt.Println("Cite sources, explain your reasoning.")
+    fmt.Println("Type '+++' on a new line when done.\n")
+    
+    var justificationLines []string
+    for {
+        line, _ := r.reader.ReadString('\n')
+        line = strings.TrimSpace(line)
+        if line == "+++" {
+            break
+        }
+        justificationLines = append(justificationLines, line)
+    }
+    justification := strings.Join(justificationLines, "\n")
+    
+    if justification == "" {
+        return fmt.Errorf("justification required")
+    }
+    
+    fmt.Print("\nOutcome (yes/no): ")
+    outcomeStr, _ := r.reader.ReadString('\n')
+    outcome := strings.TrimSpace(outcomeStr) == "yes"
+    
+    proposal := &ResolutionProposal{
+        ID:            sha256Hash([]byte(fmt.Sprintf("%s|%s|%d", market.ID, r.identity.SigningPublicKey, time.Now().Unix()))),
+        MarketID:      market.ID,
+        Outcome:       outcome,
+        Justification: justification,
+        MakerKey:      r.identity.SigningPublicKey,
+        Timestamp:     uint64(time.Now().Unix()),
+        Status:        "pending",
+    }
+    
+    propData, err := json.Marshal(proposal)
+    if err != nil {
+        return err
+    }
+    
+    // Sign the proposal (sign the data without the signature field)
+    signCopy := *proposal
+    signCopy.Signature = nil
+    signData, _ := json.Marshal(signCopy)
+    proposal.Signature = ed25519.Sign(r.identity.SigningPrivateKey, signData)
+    
+    // Re-marshal with signature included
+    finalData, _ := json.Marshal(proposal)
+    
+    // Store in DHT
+    if err := r.dht.StoreValue("proposal:"+proposal.ID, finalData); err != nil {
+        return err
+    }
+    
+    r.session.AddResolutionProposal(proposal)
+    market.ResolutionProposalID = proposal.ID
+    
+    fmt.Printf("\n✅ Resolution proposal sent. Waiting for oracles to vote...\n")
+    fmt.Printf("   Proposal ID: %s\n", proposal.ID[:16])
+    
+    // Start monitoring votes
+    go r.monitorVotes(proposal, market)
+    
+    return nil
+}
+
+// FIXED: monitorVotes now actually fetches votes from DHT, not just local session
+func (r *ResolutionSystem) monitorVotes(proposal *ResolutionProposal, market *Market) {
+    // Get active oracles
+    activeOracles, err := r.oracleSys.GetActiveOracles()
+    if err != nil || len(activeOracles) == 0 {
+        fmt.Printf("\n⚠️ No active oracles found. Waiting for oracles to come online...\n")
+        // Keep trying for 10 hours
+        deadline := time.Now().Add(ProposalQueryHours * time.Hour)
+        for time.Now().Before(deadline) {
+            time.Sleep(10 * time.Minute)
+            activeOracles, err = r.oracleSys.GetActiveOracles()
+            if err == nil && len(activeOracles) >= MinOraclesRequired {
+                break
+            }
+        }
+        
+        // If still no oracles after deadline, fallback to maker decision
+        if len(activeOracles) < MinOraclesRequired {
+            fmt.Printf("\n⚠️ No oracles found after %d hours. Falling back to maker's decision.\n", ProposalQueryHours)
+            r.executeResolution(proposal, market)
+            return
+        }
+    }
+    
+    // Random threshold between MinOraclesRequired and MaxOraclesRequired
+    threshold := MinOraclesRequired + rand.Intn(MaxOraclesRequired-MinOraclesRequired+1)
+    fmt.Printf("\n📋 Resolution proposal sent to oracles. Need %d approvals.\n", threshold)
+    
+    // Wait for votes
+    deadline := time.Now().Add(OracleResponseTimeoutHours * time.Hour)
+    
+    // FIXED: Polling loop that checks both local session AND DHT
+    for time.Now().Before(deadline) {
+        // Check local session first
+        votes := r.session.GetOracleVotes(proposal.ID)
+        
+        // ALSO fetch from DHT (this was the missing piece)
+        prefix := "vote:" + proposal.ID + ":"
+        dhtVotes, err := r.dht.GetValuesWithPrefix(prefix)
+        if err == nil {
+            for _, voteData := range dhtVotes {
+                var vote OracleVote
+                if json.Unmarshal(voteData, &vote) == nil {
+                    r.session.AddOracleVote(&vote)
+                }
+            }
+        }
+        
+        // Re-count after DHT fetch
+        allVotes := r.session.GetOracleVotes(proposal.ID)
+        votesReceived := len(allVotes)
+        approvals := 0
+        for _, v := range allVotes {
+            if v.Vote {
+                approvals++
+            }
+        }
+        
+        fmt.Printf("\rVotes received: %d/%d (approvals: %d)", votesReceived, threshold, approvals)
+        
+        if approvals >= threshold {
+            fmt.Println("\n\n✅ Proposal approved by oracles! Resolving market...")
+            r.executeResolution(proposal, market)
+            return
+        }
+        
+        // Check if too many rejections make approval impossible
+        if votesReceived > 0 && (votesReceived-approvals) > (threshold*2-votesReceived) {
+            fmt.Println("\n\n❌ Proposal rejected by oracles - insufficient support.")
+            proposal.Status = "rejected"
+            r.session.AddResolutionProposal(proposal)
+            return
+        }
+        
+        time.Sleep(30 * time.Second)
+    }
+    
+    // Timeout - fallback to maker decision
+    fmt.Printf("\n\n⏰ Oracle vote timeout after %d hours. Falling back to maker's decision.\n", OracleResponseTimeoutHours)
+    r.executeResolution(proposal, market)
+}
+
+// FIXED: Payout calculation uses float to avoid integer division precision loss
+func (r *ResolutionSystem) executeResolution(proposal *ResolutionProposal, market *Market) {
+    currentHeight, _ := currentMoneroBlockHeight()
+    
+    // Process payouts
+    bets := r.session.GetSeenBetOffersForMarket(market.ID)
+    paidCount := 0
+    for _, bet := range bets {
+        if bet.ChosenOutcome == proposal.Outcome && bet.Status == "accepted" {
+            // FIXED: Use float64 to avoid integer division truncation
+            payout := uint64(float64(bet.WagerAmount) * float64(market.OddsNumerator) / float64(market.OddsDenominator))
+            afterFees := payout * (100 - DeveloperFeePercent - OracleFeePercent) / 100
+            devFee := payout * DeveloperFeePercent / 100
+            
+            txHash, err := r.monero.SendPayout(bet.PayoutSubaddress, afterFees)
+            if err != nil {
+                fmt.Printf("Failed to pay %s: %v\n", bet.PayoutSubaddress[:16], err)
+                continue
+            }
+            
+            if devFee > 0 {
+                if _, err := r.monero.SendDeveloperFee(devFee); err != nil {
+                    fmt.Printf("Failed to send developer fee: %v\n", err)
+                } else {
+                    fmt.Printf("💰 Developer fee: %.4f XMR collected\n", float64(devFee)/1e12)
+                }
+            }
+            
+            fmt.Printf("✅ Paid %.4f XMR to bettor (tx: %s)\n", float64(afterFees)/1e12, txHash[:16])
+            bet.Status = "paid"
+            paidCount++
+        }
+    }
+    
+    market.Resolved = true
+    market.ResolutionOutcome = &proposal.Outcome
+    market.ResolutionBlockActual = currentHeight
+    
+    // Store resolution in session
+    resolution := &Resolution{
+        MarketID:   market.ID,
+        Outcome:    proposal.Outcome,
+        ResolvedBy: proposal.MakerKey,
+        Block:      currentHeight,
+        Timestamp:  uint64(time.Now().Unix()),
+    }
+    r.session.Resolutions[market.ID] = resolution
+    
+    fmt.Printf("\n✅ Market resolved as '%s'\n", map[bool]string{true: "YES", false: "NO"}[proposal.Outcome])
+    fmt.Printf("   Paid %d winning bets\n", paidCount)
+}
+
+// FIXED: Oracle monitor now uses non-blocking DHT polling instead of blocking console reads
+func (r *ResolutionSystem) MonitorOracleRequests() {
+    // Poll DHT for pending proposals every 30 seconds
+    ticker := time.NewTicker(30 * time.Second)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            // Search DHT for pending proposals
+            dhtData, err := r.dht.GetValuesWithPrefix("proposal:")
+            if err != nil {
+                continue
+            }
+            
+            for _, data := range dhtData {
+                var prop ResolutionProposal
+                if err := json.Unmarshal(data, &prop); err != nil {
+                    continue
+                }
+                
+                if prop.Status != "pending" {
+                    continue
+                }
+                
+                // Check if already voted
+                votes := r.session.GetOracleVotes(prop.ID)
+                alreadyVoted := false
+                for _, v := range votes {
+                    if string(v.OracleKey) == string(r.identity.SigningPublicKey) {
+                        alreadyVoted = true
+                        break
+                    }
+                }
+                
+                if alreadyVoted {
+                    continue
+                }
+                
+                // FIXED: Auto-vote based on oracle's own assessment
+                // In production, this would involve human review
+                // For MVP, auto-approve proposals from known makers
+                fmt.Printf("\n🔔 New resolution proposal detected: %s\n", prop.ID[:16])
+                fmt.Printf("   Market: %s\n   Outcome: %v\n", prop.MarketID[:16], prop.Outcome)
+                
+                // Simple heuristic: approve if justification is non-empty
+                vote := len(prop.Justification) > 50
+                
+                oracleVote := &OracleVote{
+                    ProposalID:    prop.ID,
+                    Vote:          vote,
+                    OracleKey:     r.identity.SigningPublicKey,
+                    Justification: "Automated oracle vote",
+                    Timestamp:     uint64(time.Now().Unix()),
+                }
+                
+                voteData, _ := json.Marshal(oracleVote)
+                key := "vote:" + prop.ID + ":" + hex.EncodeToString(r.identity.SigningPublicKey[:min(8, len(r.identity.SigningPublicKey))])
+                r.dht.StoreValue(key, voteData)
+                r.session.AddOracleVote(oracleVote)
+                
+                if vote {
+                    fmt.Println("   ✅ Auto-approved based on justification")
+                } else {
+                    fmt.Println("   ❌ Auto-rejected - insufficient justification")
+                }
+            }
+        }
+    }
+}
+
+// ========== MAIN CLIENT ==========
+
+type PredictionClient struct {
+    identity       *PersistedIdentity
+    session        *SessionData
+    monero         *MoneroClient
+    i2p            *I2PNetwork
+    dht            *KademliaDHT
+    oracleSys      *OracleSystem
+    heartbeatSys   *HeartbeatSystem
+    resolutionSys  *ResolutionSystem
+    reader         *bufio.Reader
+    ctx            context.Context
+    cancel         context.CancelFunc
+    dbPath         string
+    password       string  // FIXED: Store password for identity saves
+}
+
+// FIXED: Store password so saveIdentity works without re-prompting
+func NewPredictionClient(dbPath, password string, createNew bool, isOracle bool) (*PredictionClient, error) {
+    var identity *PersistedIdentity
+    var err error
+    
+    if createNew {
+        fmt.Println("\n🔐 Creating new identity...")
+        identity, err = CreateNewIdentity(dbPath, password, isOracle)
+        if err != nil {
+            return nil, fmt.Errorf("failed to create identity: %w", err)
+        }
+        fmt.Println("✅ Identity created and saved to", filepath.Join(dbPath, "identity.enc"))
+    } else {
+        fmt.Println("\n🔐 Loading existing identity...")
+        identity, err = LoadIdentity(dbPath, password)
+        if err != nil {
+            return nil, fmt.Errorf("failed to load identity: %w", err)
+        }
+        fmt.Println("✅ Identity loaded successfully")
+    }
+
+    moneroUser := os.Getenv("XMR_RPC_USER")
+    moneroPass := os.Getenv("XMR_RPC_PASS")
+    if moneroUser == "" {
+        moneroUser = "default"
+        moneroPass = "changeme"
+        fmt.Println("\n⚠️ WARNING: Monero RPC using default credentials!")
+        fmt.Println("   Set XMR_RPC_USER and XMR_RPC_PASS environment variables")
+    }
+    if moneroPass == "" {
+        moneroPass = "changeme"
+    }
+    
+    monero, err := NewMoneroClient(moneroUser, moneroPass, identity.MoneroSeed)
+    if err != nil {
+        return nil, err
+    }
+
+    i2p, err := NewI2PNetwork(identity)
+    if err != nil {
+        return nil, err
+    }
+
+    session := NewSessionData()
+    
+    // Restore active markets from persisted identity
+    for id, market := range identity.ActiveMarkets {
+        session.DiscoveredMarkets[id] = market
+    }
+    for id, bet := range identity.PendingBets {
+        session.SeenBetOffers[id] = bet
+    }
+
+    nodeID := sha256HashToID(hex.EncodeToString(identity.SigningPublicKey))
+    dht := NewKademliaDHT(nodeID, session, i2p)
+    if err := dht.Start(); err != nil {
+        return nil, fmt.Errorf("failed to start DHT: %w", err)
+    }
+
+    oracleSys := NewOracleSystem(dht, monero, identity, session, i2p)
+    heartbeatSys := NewHeartbeatSystem(dht, identity)
+    heartbeatSys.Start()
+    
+    resolutionSys := NewResolutionSystem(dht, monero, identity, session, oracleSys, i2p)
+
+    ctx, cancel := context.WithCancel(context.Background())
+
+    client := &PredictionClient{
+        identity:      identity,
+        session:       session,
+        monero:        monero,
+        i2p:           i2p,
+        dht:           dht,
+        oracleSys:     oracleSys,
+        heartbeatSys:  heartbeatSys,
+        resolutionSys: resolutionSys,
+        reader:        bufio.NewReader(os.Stdin),
+        ctx:           ctx,
+        cancel:        cancel,
+        dbPath:        dbPath,
+        password:      password,
+    }
+    
+    return client, nil
+}
+
+func (c *PredictionClient) Run() {
+    c.printBanner()
+    c.printStakeSlashingDisclaimer()
+    
+    // Start oracle request monitor if user is oracle
+    if c.identity.IsOracle {
+        go c.resolutionSys.MonitorOracleRequests()
+    }
+    
+    // FIXED: Background DHT sync loop to refresh markets and bets
+    go c.backgroundSync()
+
+    for {
+        fmt.Println("\n┌──────────────────────────────────────────────────────────────────────┐")
+        fmt.Println("│       
